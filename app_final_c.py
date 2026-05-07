@@ -602,7 +602,7 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
                 hot_picks.at[idx, '추세'] = tech.get('추세', '-')
                 hot_picks.at[idx, '종합 시그널'] = tech.get('종합 시그널', '-')
                 hot_picks.at[idx, '근거'] = tech.get('근거', '-')
-                hot_picks.at[idx, '차트'] = f"https://m.stock.naver.com/domestic/stock/{code}/total"
+                hot_picks.at[idx, '차트'] = f"https://m.stock.naver.com/fchart/domestic/stock/{code}"
 
             if show_debug and diag_sample is not None:
                 with st.expander("🔍 기술적 분석(yfinance) 첫 종목 응답(5행)"):
@@ -669,10 +669,12 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
                 )
                 
             with tab2:
-                display_cols2 = ['종목명_x', '시장', '현재가', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트']
-                df2 = hot_picks[[c for c in display_cols2 if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명'})
+                display_cols2 = ['종목명_x', '시장', '현재가', '적정가격', '괴리율', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트']
+                df2 = hot_picks[[c for c in display_cols2 if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명', '적정가격': '목표가'})
                 
                 df2['현재가'] = df2['현재가'].apply(lambda x: f"{int(x):,}")
+                if '목표가' in df2.columns:
+                    df2['목표가'] = df2['목표가'].apply(lambda x: f"{int(x):,}")
                 
                 def color_signal_bg(val):
                     s = str(val)
