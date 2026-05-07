@@ -14,6 +14,44 @@ except ImportError:
 
 st.set_page_config(page_title="AI 투자 전략 엔진", layout="wide")
 
+st.markdown("""
+<style>
+    /* 전체 폰트 축소 */
+    html, body, [class*="css"] {
+        font-size: 13px !important;
+    }
+    /* 데이터프레임 셀 축소 */
+    .stDataFrame, .stDataFrame [data-testid="stTable"] {
+        font-size: 12px !important;
+    }
+    .stDataFrame td, .stDataFrame th {
+        padding: 4px 6px !important;
+    }
+    /* 메트릭 박스 축소 */
+    [data-testid="stMetricValue"] {
+        font-size: 18px !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 11px !important;
+    }
+    /* 제목 약간 축소 */
+    h1 { font-size: 24px !important; }
+    h2 { font-size: 20px !important; }
+    h3 { font-size: 16px !important; }
+    /* 메인 컨테이너 패딩 축소 */
+    .main .block-container {
+        padding-top: 1rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        max-width: 100% !important;
+    }
+    /* 탭 폰트 축소 */
+    .stTabs [data-baseweb="tab"] {
+        font-size: 13px !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # ============ 클라우드 전용: 비밀번호 보호 ============
 PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
