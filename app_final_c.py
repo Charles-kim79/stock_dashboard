@@ -602,6 +602,7 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
                 hot_picks.at[idx, '추세'] = tech.get('추세', '-')
                 hot_picks.at[idx, '종합 시그널'] = tech.get('종합 시그널', '-')
                 hot_picks.at[idx, '근거'] = tech.get('근거', '-')
+                hot_picks.at[idx, '차트'] = f"https://m.stock.naver.com/domestic/stock/{code}/total"
 
             if show_debug and diag_sample is not None:
                 with st.expander("🔍 기술적 분석(yfinance) 첫 종목 응답(5행)"):
@@ -668,7 +669,7 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
                 )
                 
             with tab2:
-                display_cols2 = ['종목명_x', '시장', '현재가', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거']
+                display_cols2 = ['종목명_x', '시장', '현재가', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트']
                 df2 = hot_picks[[c for c in display_cols2 if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명'})
                 
                 df2['현재가'] = df2['현재가'].apply(lambda x: f"{int(x):,}")
@@ -681,11 +682,22 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
                     return ''
                 
                 styled = df2.style.map(color_signal_bg, subset=['종합 시그널'])
-                st.dataframe(styled, hide_index=True, width=1400)
+                st.dataframe(
+                    styled,
+                    hide_index=True,
+                    width=1400,
+                    column_config={
+                        "차트": st.column_config.LinkColumn(
+                            "차트",
+                            display_text="📈 보기",
+                            help="네이버 증권 차트로 이동"
+                        )
+                    }
+                )
 
             st.session_state['hot_picks'] = hot_picks
 
-            csv_cols = ['작성일', '종목명_x', '시장', '현재가', '등락률', '적정가격', '괴리율', '시가총액', 'PER', 'PBR', '영익률', '매출액', '영업이익', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '투자의견', '작성기관', '리포트제목', 'PDF링크']
+            csv_cols = ['작성일', '종목명_x', '시장', '현재가', '등락률', '적정가격', '괴리율', '시가총액', 'PER', 'PBR', '영익률', '매출액', '영업이익', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트', '투자의견', '작성기관', '리포트제목', 'PDF링크']
             csv_df = hot_picks[[c for c in csv_cols if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명'})
             
             csv = csv_df.to_csv(index=False).encode('utf-8-sig')
