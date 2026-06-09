@@ -652,50 +652,106 @@ if st.button('🚀 오늘의 핫픽 추출', type="primary"):
             tab1, tab2 = st.tabs(["📊 펀더멘털 분석", "📈 기술적 분석"])
             
             with tab1:
+                st.caption("👆 표에서 종목을 클릭하면 해당 종목 정보가 위에 카드로 표시됩니다.")
+
                 display_cols1 = ['작성일', '종목명_x', '시장', '현재가', '등락률', '적정가격',
                                 '괴리율', '시가총액', 'PER', 'PBR', '영익률', '매출액', '영업이익', '투자의견', '작성기관', '리포트제목', 'PDF링크']
                 df1 = hot_picks[[c for c in display_cols1 if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명'})
-                
-                df1['현재가'] = df1['현재가'].apply(lambda x: f"{int(x):,}")
-                df1['적정가격'] = df1['적정가격'].apply(lambda x: f"{int(x):,}")
-                
-                st.dataframe(
+
+                # 카드 표시 영역 (선택 시 채워짐)
+                card1 = st.container()
+
+                event1 = st.dataframe(
                     df1,
                     column_config={
+                        "현재가": st.column_config.NumberColumn("현재가", format="%,d"),
+                        "적정가격": st.column_config.NumberColumn("적정가격", format="%,d"),
                         "PDF링크": st.column_config.LinkColumn("리포트", display_text="📄")
                     },
                     hide_index=True,
-                    width=1400
+                    width=1400,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="fund_table"
                 )
+
+                if event1.selection.rows:
+                    sel = df1.iloc[event1.selection.rows[0]]
+                    with card1:
+                        st.markdown(f"#### 📌 {sel.get('종목명', '-')}  ·  {sel.get('시장', '')}")
+                        m1, m2, m3, m4 = st.columns(4)
+                        cur = sel.get('현재가'); tgt = sel.get('적정가격')
+                        m1.metric("현재가", f"{int(cur):,}원" if pd.notnull(cur) else "-")
+                        m2.metric("목표가", f"{int(tgt):,}원" if pd.notnull(tgt) else "-")
+                        m3.metric("괴리율", str(sel.get('괴리율', '-')))
+                        m4.metric("투자의견", str(sel.get('투자의견', '-')))
+                        n1, n2, n3 = st.columns(3)
+                        n1.markdown(f"**PER** {sel.get('PER', '-')}")
+                        n2.markdown(f"**PBR** {sel.get('PBR', '-')}")
+                        n3.markdown(f"**영익률** {sel.get('영익률', '-')}")
+                        st.markdown(
+                            f"**시가총액** {sel.get('시가총액', '-')}  ·  "
+                            f"**매출액** {sel.get('매출액', '-')}  ·  "
+                            f"**영업이익** {sel.get('영업이익', '-')}"
+                        )
+                        st.markdown(f"**리포트** {sel.get('리포트제목', '-')}  ·  _{sel.get('작성기관', '')}_")
+                        st.markdown("---")
                 
             with tab2:
-                display_cols2 = ['종목명_x', '시장', '현재가', '적정가격', '괴리율', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트']
+                st.caption("👆 표에서 종목을 클릭하면 해당 종목 정보가 위에 카드로 표시됩니다.")
+
+                display_cols2 = ['작성일', '종목명_x', '시장', '현재가', '적정가격', '괴리율', 'RSI', '볼린저 위치', '추세', '종합 시그널', '근거', '차트']
                 df2 = hot_picks[[c for c in display_cols2 if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명', '적정가격': '목표가'})
-                
-                df2['현재가'] = df2['현재가'].apply(lambda x: f"{int(x):,}")
-                if '목표가' in df2.columns:
-                    df2['목표가'] = df2['목표가'].apply(lambda x: f"{int(x):,}")
-                
+
+                # 카드 표시 영역
+                card2 = st.container()
+
                 def color_signal_bg(val):
                     s = str(val)
                     if '💚' in s: return 'background-color: #d4edda; color: black;'
                     if '💛' in s: return 'background-color: #fff3cd; color: black;'
                     if '❤️' in s: return 'background-color: #f8d7da; color: black;'
                     return ''
-                
+
                 styled = df2.style.map(color_signal_bg, subset=['종합 시그널'])
-                st.dataframe(
+                event2 = st.dataframe(
                     styled,
                     hide_index=True,
                     width=1400,
                     column_config={
+                        "현재가": st.column_config.NumberColumn("현재가", format="%,d"),
+                        "목표가": st.column_config.NumberColumn("목표가", format="%,d"),
                         "차트": st.column_config.LinkColumn(
                             "차트",
                             display_text="📈 보기",
                             help="네이버 증권 차트로 이동"
                         )
-                    }
+                    },
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="tech_table"
                 )
+
+                if event2.selection.rows:
+                    sel = df2.iloc[event2.selection.rows[0]]
+                    with card2:
+                        st.markdown(f"#### 📌 {sel.get('종목명', '-')}  ·  {sel.get('시장', '')}")
+                        m1, m2, m3 = st.columns(3)
+                        cur = sel.get('현재가'); tgt = sel.get('목표가')
+                        m1.metric("현재가", f"{int(cur):,}원" if pd.notnull(cur) else "-")
+                        m2.metric("목표가", f"{int(tgt):,}원" if pd.notnull(tgt) else "-")
+                        m3.metric("괴리율", str(sel.get('괴리율', '-')))
+                        st.markdown(
+                            f"**RSI** {sel.get('RSI', '-')}  ·  "
+                            f"**볼린저** {sel.get('볼린저 위치', '-')}  ·  "
+                            f"**추세** {sel.get('추세', '-')}"
+                        )
+                        st.markdown(f"### {sel.get('종합 시그널', '-')}")
+                        st.caption(f"근거: {sel.get('근거', '-')}")
+                        chart_url = sel.get('차트', '')
+                        if chart_url:
+                            st.markdown(f"[📈 네이버 차트 보기]({chart_url})")
+                        st.markdown("---")
 
             st.session_state['hot_picks'] = hot_picks
 
