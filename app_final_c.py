@@ -7,7 +7,7 @@ import re
 import time
 import hmac
 
-APP_VERSION = "v1.5"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
+APP_VERSION = "v1.6"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
 
 try:
     import yfinance as yf
@@ -48,10 +48,23 @@ st.markdown("""
         padding-right: 1rem !important;
         max-width: 100% !important;
     }
-    /* 탭 폰트 축소 */
+    /* 탭: 눈에 띄는 버튼형 (어디를 눌러야 하는지 한눈에) */
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid rgba(128,128,128,0.25); }
     .stTabs [data-baseweb="tab"] {
-        font-size: 13px !important;
+        font-size: 15px !important; font-weight: 700 !important;
+        padding: 10px 18px !important; border-radius: 8px 8px 0 0;
+        background: rgba(128,128,128,0.12);
     }
+    .stTabs [aria-selected="true"] { background: #ff4b4b !important; color: #ffffff !important; }
+    .stTabs [aria-selected="true"] p { color: #ffffff !important; }
+    .stTabs [data-baseweb="tab-highlight"] { display: none; }
+    /* 주요 버튼 강조 */
+    .stButton button[kind="primary"], .stFormSubmitButton button[kind="primary"] {
+        font-size: 15px !important; font-weight: 700 !important; padding: 0.55rem 1.3rem !important;
+    }
+    .stButton button { font-weight: 600 !important; }
+    /* 섹션 제목 강조 */
+    h2, h3 { border-left: 5px solid #ff4b4b; padding-left: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -779,13 +792,21 @@ def score_stock(cur, target, n_reports, d, num, mkt_dd, mode):
     return items, ctx
 
 
-def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
-    """점수 + 가격 계획 + 판정(매수 적정/대기/제외). trend: 목표가 추이(target_trend 결과)"""
+def level_of(pct):
+    """득점률(%) → 상/중/하 + 신호등"""
+    return ('🟢 상', '상') if pct >= 70 else ('🟡 중', '중') if pct >= 40 else ('🔴 하', '하')
+
+
+def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None, regime=None):
+    """점수 + 가격 계획 + 판정(매수 적정/대기/제외).
+    trend: 목표가 추이(target_trend 결과), regime: 시장 신호 (아이콘, 라벨, 조언)"""
     items, ctx = score_stock(cur, target, n_reports, d, num, mkt_dd, mode)
     cats = {c: (sum(i['pts'] for i in items if i['cat'] == c), mx) for c, mx in CATS}
     score = sum(p for p, _ in cats.values())
     out = {'items': items, 'cats': cats, 'score': score, 'total': 100, 'target': target, 'cur': cur,
-           'stop': None, 'rr': None, 'loss_pct': None, 'wait_price': None, 'mode': mode, 'plan': None}
+           'cat_pct': {c: round(p / mx * 100) for c, (p, mx) in cats.items()},
+           'stop': None, 'rr': None, 'loss_pct': None, 'wait_price': None, 'mode': mode, 'plan': None,
+           'target_eff': target, 'upside_pct': (target / cur - 1) * 100 if cur else None}
     num = num or {}
 
     if mode == MODE_LONG:
@@ -798,12 +819,16 @@ def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
             'review_below': prices[-1] * (1 - step / 100),
         }
     elif num:
+        # 스윙은 1주~1달 보유 기준 → 증권사 목표가(보통 12개월)를 '목표 수익률 상한'으로 현실화
+        t_eff = min(target, cur * (1 + params.get('swing_cap', 20) / 100))
+        out['target_eff'] = t_eff
+        out['upside_pct'] = (t_eff / cur - 1) * 100
         stop = min(num['low20'] * 0.98, cur * 0.97)
         risk = cur - stop
         out['stop'] = stop
         out['loss_pct'] = risk / cur * 100
-        out['rr'] = (target - cur) / risk if risk > 0 else None
-        p_rr = (target + params['min_rr'] * stop) / (1 + params['min_rr'])
+        out['rr'] = (t_eff - cur) / risk if risk > 0 else None
+        p_rr = (t_eff + params['min_rr'] * stop) / (1 + params['min_rr'])
         p_loss = stop / (1 - params['max_loss'] / 100)
         wp = min(p_rr, p_loss, cur)
         out['wait_price'] = wp if wp > stop else None
@@ -826,6 +851,8 @@ def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
         event_reasons.append(f"실적 발표 D-{int(ctx['earn_dday'])} — 발표 후 재검토")
     if trend and trend.get('dir') == 'down':
         event_reasons.append(f"목표가 연속 하향({trend['text']}) — 가설 재점검")
+    if mode == MODE_SWING and params.get('mkt_gate') and regime and regime[0] == '🔴':
+        event_reasons.append(f"시장 {regime[1]} — 오늘은 신규 매수 보류")
     if event_reasons:
         out['verdict'], out['reason'] = VERDICT_WAIT, ' · '.join(event_reasons)
         return out
@@ -852,15 +879,151 @@ def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
         if out['rr'] is None:
             reasons.append('손익비 계산 불가')
         elif out['rr'] < params['min_rr']:
-            reasons.append(f"손익비 {out['rr']:.1f} < {params['min_rr']}")
+            reasons.append(f"기대수익 +{out['upside_pct']:.0f}% 대비 위험 -{out['loss_pct']:.1f}% → 손익비 {out['rr']:.1f} (기준 {params['min_rr']} 미만)")
         if out['loss_pct'] is not None and out['loss_pct'] > params['max_loss']:
             reasons.append(f"손절폭 {out['loss_pct']:.1f}% > 허용 {params['max_loss']}%")
     if reasons:
         out['verdict'], out['reason'] = VERDICT_WAIT, ' · '.join(reasons)
     else:
         out['verdict'] = VERDICT_BUY
-        out['reason'] = f"{score}점 · 손익비 {out['rr']:.1f} · 손절폭 {out['loss_pct']:.1f}%"
+        out['reason'] = (f"{score}점 · 기대수익 +{out['upside_pct']:.0f}% vs 위험 -{out['loss_pct']:.1f}% "
+                         f"(손익비 {out['rr']:.1f})")
     return out
+
+# =========================
+# 시장 신호 (매크로): 지수 추세 + 환율·유가·금리·VIX → 오늘 매수해도 되는 장인가
+# =========================
+MACRO_TICKERS = {
+    'KOSPI': '^KS11', 'KOSDAQ': '^KQ11', 'S&P500': '^GSPC',
+    '환율(원/$)': 'KRW=X', '유가(WTI)': 'CL=F', '미국10년금리': '^TNX', 'VIX': '^VIX',
+}
+
+
+@st.cache_data(ttl=1800)
+def get_macro():
+    """주요 지수·환율·유가·금리의 최근 흐름 (yfinance 일봉 6개월). 실패 항목은 빠짐"""
+    out = {}
+    if not YF_AVAILABLE:
+        return out
+    for name, tk in MACRO_TICKERS.items():
+        try:
+            df = yf.download(tk, period='6mo', interval='1d', progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            s = df['Close'].dropna()
+            if len(s) < 25:
+                continue
+            ma20 = s.rolling(20).mean()
+            ma60 = s.rolling(60).mean() if len(s) >= 60 else None
+            out[name] = {
+                'close': float(s.iloc[-1]),
+                'chg1': float(s.iloc[-1] / s.iloc[-2] - 1) * 100,
+                'chg5': float(s.iloc[-1] / s.iloc[-6] - 1) * 100,
+                'chg20': float(s.iloc[-1] / s.iloc[-21] - 1) * 100,
+                'abs5': float(s.iloc[-1] - s.iloc[-6]),
+                'ma20': float(ma20.iloc[-1]),
+                'ma20_5ago': float(ma20.iloc[-6]),
+                'ma60': float(ma60.iloc[-1]) if ma60 is not None else None,
+                'low20': float(s.tail(20).min()),
+                'high20': float(s.tail(20).max()),
+                'below_ma20_recent': bool((s.tail(4).iloc[:-1] < ma20.tail(4).iloc[:-1]).any()),
+            }
+        except Exception:
+            continue
+    return out
+
+
+def index_regime(m):
+    """지수 1개의 추세 상태 → (신호등, 라벨, 조언)"""
+    if not m:
+        return ('⚪', '데이터 없음', '판단 보류')
+    c, ma20, ma60 = m['close'], m['ma20'], m['ma60']
+    slope = (ma20 / m['ma20_5ago'] - 1) if m['ma20_5ago'] else 0
+    bounce = (c / m['low20'] - 1) * 100            # 최근 20일 저점 대비 반등폭
+    breakout = c >= m['high20'] and c > ma20       # 20일 고점 돌파
+    above = c > ma20
+    if above and slope > 0 and (ma60 is None or c > ma60):
+        return ('🟢', '상승 추세' + (' · 고점 돌파' if breakout else ''), '정상적으로 매수 후보를 볼 수 있는 장')
+    if above and m['below_ma20_recent']:
+        return ('🟡', '추세 전환 시도 (20일선 상향 돌파)', '확인 중 — 소액·분할로만 접근')
+    if not above and bounce >= 5 and m['chg5'] >= 2:
+        return ('🟡', '반등 강함 (아직 20일선 아래)', '선별 매수 가능 — 비중은 평소의 절반')
+    if not above and slope < 0:
+        if bounce < 3:
+            return ('🔴', '하락 지속', '오늘은 신규 매수 보류 — 반등 확인 후')
+        return ('🟡', '반등 약함', '관망 — 20일선 회복 전까지 대기')
+    return ('🟡', '횡보', '선별 매수 (종목 판정 우선)')
+
+
+def macro_impacts(mac):
+    """환율·유가·금리·VIX 변화의 영향 (규칙 기반 설명). [(아이콘, 제목, 설명)]"""
+    notes = []
+    fx = mac.get('환율(원/$)')
+    if fx:
+        if fx['chg5'] >= 1.5:
+            notes.append(('🔺', f"원화 약세 (환율 {fx['close']:,.0f}원, 5일 {fx['chg5']:+.1f}%)",
+                          "외국인 매도 압력·수입물가 부담 → 내수·항공·정유 불리 / 반도체·자동차 등 수출주 상대 유리"))
+        elif fx['chg5'] <= -1.5:
+            notes.append(('🔻', f"원화 강세 (환율 {fx['close']:,.0f}원, 5일 {fx['chg5']:+.1f}%)",
+                          "외국인 수급 우호 → 증시에는 긍정 / 수출주 마진엔 부담"))
+    oil = mac.get('유가(WTI)')
+    if oil:
+        if oil['chg5'] >= 5:
+            notes.append(('🔺', f"유가 급등 (WTI {oil['close']:.1f}$, 5일 {oil['chg5']:+.1f}%)",
+                          "정유·에너지 유리 / 항공·화학·운송은 비용 부담 / 물가·금리 압력으로 성장주에 부정적"))
+        elif oil['chg5'] <= -5:
+            notes.append(('🔻', f"유가 급락 (WTI {oil['close']:.1f}$, 5일 {oil['chg5']:+.1f}%)",
+                          "항공·화학 비용 완화 / 정유·에너지 부담 / 경기 둔화 우려 신호일 수 있음"))
+    rate = mac.get('미국10년금리')
+    if rate:
+        if rate['abs5'] >= 0.15:
+            notes.append(('🔺', f"미 금리 상승 (10년물 {rate['close']:.2f}%, 5일 {rate['abs5']:+.2f}%p)",
+                          "성장주·바이오 밸류에이션 부담 / 은행·보험 상대 유리"))
+        elif rate['abs5'] <= -0.15:
+            notes.append(('🔻', f"미 금리 하락 (10년물 {rate['close']:.2f}%, 5일 {rate['abs5']:+.2f}%p)",
+                          "성장주·바이오에 우호적"))
+    vix = mac.get('VIX')
+    if vix:
+        if vix['close'] >= 25:
+            notes.append(('⚠️', f"변동성 확대 (VIX {vix['close']:.1f})", "공포 구간 — 신규 매수는 분할·소액으로"))
+        elif vix['close'] <= 15:
+            notes.append(('✅', f"변동성 안정 (VIX {vix['close']:.1f})", "위험 선호 우호적"))
+    return notes
+
+
+def render_market_banner():
+    """화면 맨 위 '오늘의 시장 신호' — 결론(한 줄) → 지수 신호등 → 매크로 영향"""
+    mac = get_macro()
+    st.markdown("### 🌐 오늘의 시장 신호")
+    if not mac:
+        st.info("시장 데이터를 가져오지 못했습니다 (yfinance). 잠시 후 새로고침해 보세요.")
+        return None
+    regs = {k: index_regime(mac.get(k)) for k in ('KOSPI', 'KOSDAQ')}
+    order = {'🔴': 0, '🟡': 1, '🟢': 2, '⚪': 1}
+    worst = min(regs.values(), key=lambda r: order[r[0]])
+    box = {'🔴': st.error, '🟡': st.warning, '🟢': st.success, '⚪': st.info}[worst[0]]
+    box(f"**{worst[0]} {worst[1]}** — {worst[2]}")
+
+    cols = st.columns(4)
+    for col, k in zip(cols[:2], ('KOSPI', 'KOSDAQ')):
+        m = mac.get(k)
+        if m:
+            col.metric(f"{regs[k][0]} {k}", f"{m['close']:,.0f}", f"5일 {m['chg5']:+.1f}%")
+            col.caption(regs[k][1])
+    for col, k in zip(cols[2:], ('환율(원/$)', '유가(WTI)')):
+        m = mac.get(k)
+        if m:
+            col.metric(k, f"{m['close']:,.1f}", f"5일 {m['chg5']:+.1f}%", delta_color="off")
+
+    notes = macro_impacts(mac)
+    if notes:
+        with st.expander(f"📌 매크로 변화가 주는 영향 ({len(notes)}건)", expanded=True):
+            for icon, title, desc in notes:
+                st.markdown(f"{icon} **{title}**  \n{desc}")
+    else:
+        st.caption("환율·유가·금리에 특이한 급변은 없습니다.")
+    return regs
+
 
 # =========================
 # 내 포트폴리오 저장소 (Supabase 연결 시 영구 저장, 미연결 시 세션 메모리)
@@ -1052,14 +1215,17 @@ def _norm(v):
     """표 편집 전후 비교용: None/NaN → 빈 문자열"""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ''
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)                                   # 5.0 과 5 를 같은 값으로 취급
     return str(v).strip()
 
 
 def render_portfolio():
-    """📂 내 관심종목: 표 하나에서 상태·구분·컨셉·메모를 바로 수정하고 저장"""
+    """📂 내 관심종목: 표 하나에서 상태·구분·컨셉·메모·매수가·수량을 바로 수정하고 저장"""
     st.subheader("📂 내 관심종목")
-    st.caption("표에서 **상태·구분·컨셉·메모**를 직접 고친 뒤 '💾 변경 저장'을 누르세요. "
-               "상태를 '보유'로 바꾸려면 메모에 **매수 이유(10자 이상)**가 있어야 합니다. 삭제는 체크 후 저장.")
+    st.info("**사용법** — ① 표의 칸(상태·구분·컨셉·메모·매수가·수량)을 눌러 직접 고치고 → ② **💾 변경 저장**  \n"
+            "**삭제**: 행 왼쪽 체크박스를 선택하고 표 위 🗑 아이콘(또는 Delete 키) → ② 저장 (저장 전까지는 되돌릴 수 있음)  \n"
+            "상태를 '보유'로 바꾸려면 메모에 **매수 이유(10자 이상)**가 있어야 합니다.")
     if not _sb():
         st.warning("⚠️ 저장소 미연결 — 지금은 이 브라우저 세션에만 저장돼 새로고침하면 사라집니다. "
                    "README의 'Supabase 연결'을 따라 Secrets에 키를 넣으세요.")
@@ -1087,11 +1253,12 @@ def render_portfolio():
         price = get_last_price(p['code'], p['market']) if p['status'] != 'closed' else None
         by_id[p['id']] = p
         rows.append({
-            '삭제': False, 'ID': p['id'], '종목': p['name'], '상태': label,
+            'ID': p['id'], '종목': p['name'], '상태': label,
             '구분': m.get('bucket', BUCKETS[0]), '컨셉': m.get('theme') or '',
             '메모': m.get('note') or p.get('reason') or '',
-            '담은가': p['entry_price'], '현재가': int(price) if price else None,
-            '변화(%)': round((price / p['entry_price'] - 1) * 100, 1) if price else None,
+            '매수가': p['entry_price'], '수량': m.get('qty'),
+            '현재가': int(price) if price else None,
+            '수익률(%)': round((price / p['entry_price'] - 1) * 100, 1) if price and p['entry_price'] else None,
             '목표가': p['target_price'], '손절가': p.get('stop_price'),
             '점수': m.get('score'), '알림': plan_status(p, price) if p['status'] != 'closed' else '',
         })
@@ -1102,36 +1269,40 @@ def render_portfolio():
 
     df = pd.DataFrame(rows).dropna(axis=1, how='all')
     ver = st.session_state.get('pf_ver', 0)
-    locked = [c for c in df.columns if c not in ('삭제', '상태', '구분', '컨셉', '메모')]
+    editable = ('상태', '구분', '컨셉', '메모', '매수가', '수량')
+    locked = [c for c in df.columns if c not in editable]
     edited = st.data_editor(
-        df, hide_index=True, width=1400, disabled=locked,
+        df, hide_index=True, width=1400, disabled=locked, num_rows="dynamic",
         key=f"pf_editor_{ver}_{f_status}_{f_theme}",
         column_config={
-            '삭제': st.column_config.CheckboxColumn('삭제', width='small'),
             '상태': st.column_config.SelectboxColumn('상태', options=list(LABEL_STATUS.keys()), required=True),
             '구분': st.column_config.SelectboxColumn('구분', options=BUCKETS, required=True),
             '컨셉': st.column_config.TextColumn('컨셉', help="섹터·테마 (예: AI반도체, 배당주)"),
             '메모': st.column_config.TextColumn('메모', help="왜 담았나 / 매수 이유", width='large'),
-            '담은가': st.column_config.NumberColumn('담은가', format="%,d"),
+            '매수가': st.column_config.NumberColumn('매수가(평균)', format="%,d", min_value=0, step=100,
+                                                help="여러 번 샀다면 아래 '➕ 추가 매수' 계산기로 평균가를 갱신"),
+            '수량': st.column_config.NumberColumn('수량', format="%,d", min_value=0, step=1),
             '현재가': st.column_config.NumberColumn('현재가', format="%,d"),
-            '변화(%)': st.column_config.NumberColumn('변화(%)', format="%.1f"),
+            '수익률(%)': st.column_config.NumberColumn('수익률(%)', format="%.1f"),
             '목표가': st.column_config.NumberColumn('목표가', format="%,d"),
             '손절가': st.column_config.NumberColumn('손절가', format="%,d"),
         })
 
     if st.button("💾 변경 저장", type="primary", key="pf_save"):
         orig = {r['ID']: r for r in rows}
+        kept = {int(i) for i in edited['ID'].dropna()}
         done, errors = 0, []
+        for pid in set(orig) - kept:                                  # 표에서 삭제한 행
+            ok_, msg = delete_plan(pid)
+            done += ok_
+            if not ok_:
+                errors.append(f"{orig[pid]['종목']}: {msg}")
         for _, r in edited.iterrows():
+            if pd.isna(r['ID']):                                      # 새로 추가된 빈 행은 무시
+                continue
             pid = int(r['ID'])
             o, p = orig[pid], by_id[pid]
-            if r['삭제']:
-                ok_, msg = delete_plan(pid)
-                done += ok_
-                if not ok_:
-                    errors.append(f"{r['종목']}: {msg}")
-                continue
-            if all(_norm(r[k]) == _norm(o[k]) for k in ('상태', '구분', '컨셉', '메모')):
+            if all(_norm(r[k]) == _norm(o[k]) for k in editable if k in r.index and k in o):
                 continue
             new_status = LABEL_STATUS[r['상태']]
             theme, note = _norm(r['컨셉']), _norm(r['메모'])
@@ -1143,7 +1314,11 @@ def render_portfolio():
                 continue
             meta = dict(meta_of(p))
             meta.update({'bucket': r['구분'], 'theme': theme, 'note': note})
+            if '수량' in r.index and pd.notna(r['수량']):
+                meta['qty'] = int(r['수량'])
             fields = {'plan': meta, 'status': new_status}
+            if '매수가' in r.index and pd.notna(r['매수가']) and r['매수가'] > 0:
+                fields['entry_price'] = int(r['매수가'])
             if new_status == 'open' and p['status'] != 'open':
                 fields['reason'] = note
                 fields['exception'] = meta.get('verdict') != VERDICT_BUY     # 규칙 미통과 종목을 산 경우 표시
@@ -1161,18 +1336,50 @@ def render_portfolio():
         elif not done and not errors:
             st.info("변경된 내용이 없습니다.")
 
+    # ➕ 추가 매수: 여러 번 샀을 때 평균 매수가·수량 자동 계산
+    with st.expander("➕ 추가 매수 (평균 매수가 자동 계산)"):
+        cands = [p for p in plans if p['status'] in ('watch', 'open')]
+        if not cands:
+            st.caption("관심/보유 종목이 있어야 사용할 수 있습니다.")
+        else:
+            lab = {f"{p['name']} · 현재 매수가 {int(p['entry_price']):,}원 · 수량 {int(meta_of(p).get('qty') or 0):,}주": p
+                   for p in cands}
+            pick = st.selectbox("종목", list(lab.keys()), key="addbuy_pick")
+            p = lab[pick]
+            old_q = int(meta_of(p).get('qty') or 0)
+            g1, g2 = st.columns(2)
+            add_p = g1.number_input("이번 매수가(원)", min_value=0, step=100, key="addbuy_p")
+            add_q = g2.number_input("이번 매수 수량(주)", min_value=0, step=1, key="addbuy_q")
+            if add_p > 0 and add_q > 0:
+                if old_q <= 0:
+                    st.warning("기존 수량이 없어 평균을 낼 수 없습니다. 위 표의 '수량' 칸에 기존 보유 수량을 먼저 입력·저장하세요.")
+                else:
+                    new_q = old_q + int(add_q)
+                    new_avg = (p['entry_price'] * old_q + add_p * add_q) / new_q
+                    st.success(f"새 평균 매수가 **{new_avg:,.0f}원** · 총 수량 **{new_q:,}주**  "
+                               f"(기존 {int(p['entry_price']):,}원×{old_q:,}주 + 추가 {int(add_p):,}원×{int(add_q):,}주)")
+                    if st.button("이 값으로 적용", key="addbuy_apply"):
+                        meta = dict(meta_of(p))
+                        meta['qty'] = new_q
+                        ok_, msg = update_plan(p['id'], {'plan': meta, 'entry_price': int(round(new_avg))})
+                        if ok_:
+                            st.session_state['pf_ver'] = ver + 1
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
     # 컨셉별 요약 (현재 표시 중인 종목 기준)
     sdf = pd.DataFrame(rows)
     sdf = sdf[sdf['상태'] != '종료']
     if not sdf.empty:
         sdf['컨셉'] = sdf['컨셉'].replace('', '(미지정)')
         sdf['점수'] = pd.to_numeric(sdf['점수'], errors='coerce')
-        sdf['변화(%)'] = pd.to_numeric(sdf['변화(%)'], errors='coerce') if '변화(%)' in sdf else None
+        sdf['수익률(%)'] = pd.to_numeric(sdf['수익률(%)'], errors='coerce')
         g = sdf.groupby('컨셉').agg(종목수=('종목', 'size'), 평균점수=('점수', 'mean'),
-                                  평균변화=('변화(%)', 'mean')).round(1).reset_index()
-        with st.expander("🧭 컨셉별 요약 (담은 뒤 평균 변화와 당시 점수)"):
+                                  평균수익률=('수익률(%)', 'mean')).round(1).reset_index()
+        with st.expander("🧭 컨셉별 요약 (평균 수익률과 담을 때 점수)"):
             st.dataframe(g.sort_values('종목수', ascending=False), hide_index=True, width=700,
-                         column_config={"평균변화": st.column_config.NumberColumn("평균변화(%)", format="%.1f")})
+                         column_config={"평균수익률": st.column_config.NumberColumn("평균수익률(%)", format="%.1f")})
 
 
 def fmt_num(v, nd=1, suf=''):
@@ -1216,18 +1423,60 @@ def render_pick_form(evs, key):
             st.error(' / '.join(failed))
 
 
-def render_stock_report(code, ev, d, tech):
-    """종목 1개 종합 리포트 — 판정·펀더멘털·기술·가격계획·리포트를 한 화면에 요약"""
+def render_stock_report(code, ev, d, tech, regime=None):
+    """종목 1개 종합 리포트 — ①결론 ②4분류 상/중/하 ③가격계획 ④강점·우려 ⑤세부 점수표 ⑥수급·일정·목표가추이"""
     d = d or {}
     tech = tech or {}
-    num = tech.get('_num') or {}
 
-    st.markdown(f"### {ev['name']} · {ev['market']} — {ev['verdict']} · {ev['score']}점")
-    st.caption(ev['reason'])
+    # ① 결론
+    box = {VERDICT_BUY: st.success, VERDICT_WAIT: st.warning, VERDICT_SKIP: st.info}.get(ev['verdict'], st.info)
+    box(f"**{ev['verdict']}** — {ev['name']} · {ev['market']} · 종합 **{ev['score']}점**  \n{ev['reason']}")
     if ev.get('no_target'):
-        st.warning("증권사 목표가가 없어 괴리율·손익비 해석에 주의가 필요합니다(목표가=현재가로 계산).")
+        st.warning("증권사 목표가가 없어 기대수익·손익비 해석에 주의가 필요합니다(목표가=현재가로 계산).")
+    if regime:
+        st.caption(f"시장 신호: {regime[0]} {regime[1]} — {regime[2]}")
 
-    # 요약: 강점 / 우려 (항목별 득점률 기준 자동 추출)
+    # ② 4분류 상/중/하
+    cols = st.columns(4)
+    for col, (cat, _) in zip(cols, CATS):
+        pct = ev['cat_pct'][cat]
+        col.metric(cat, f"{pct}% · {level_of(pct)[0]}")
+    st.caption("점수는 '종목의 질', 판정은 '점수 + 가격 조건 + 시장 상황'까지 본 결론입니다. 점수가 높아도 가격·시장이 안 맞으면 💛 대기입니다.")
+
+    # ③ 가격 계획
+    if ev.get('plan'):
+        plan = ev['plan']
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("현재가", f"{int(ev['cur']):,}원")
+        a2.metric("증권사 목표가", f"{int(ev['target']):,}원", f"{ev['upside_pct']:+.0f}%", delta_color="off")
+        a3.metric("분할 완료 시 평단", f"{int(plan['avg']):,}원")
+        a4.metric("평단 기준 상승여력", f"{plan['upside']:+.0f}%" if plan['upside'] is not None else "-")
+        if ev['verdict'] == VERDICT_BUY:
+            st.markdown("**📐 분할 매수 계획** — 직전 매수가보다 간격만큼 하락할 때만 다음 매수")
+            st.dataframe(pd.DataFrame([
+                {'회차': f"{i}차", '매수가': int(p), '투입 비중(%)': round(w, 2)}
+                for i, (p, w) in enumerate(plan['tranches'], 1)
+            ]), hide_index=True)
+            st.info(f"🛑 **가격 손절 대신 재검토 조건**: ① {int(plan['review_below']):,}원 이하로 추가 하락 "
+                    "② 적자 전환/영업이익 급감 ③ 증권사 목표가 연속 하향 — 하나라도 해당하면 추가 매수를 멈추고 가설을 다시 점검")
+        elif ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
+            st.warning(f"⏳ **{int(ev['wait_price']):,}원 이하**(6개월 고점 -15%)로 내려오면 분할 매수를 시작할 수 있습니다.")
+    else:
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("현재가", f"{int(ev['cur']):,}원")
+        a2.metric("기대수익", f"{ev['upside_pct']:+.0f}%" if ev.get('upside_pct') is not None else "-",
+                  f"목표 {int(ev['target_eff']):,}원", delta_color="off")
+        a3.metric("감수할 위험", f"-{ev['loss_pct']:.1f}%" if ev['loss_pct'] else "-",
+                  f"손절 {int(ev['stop']):,}원" if ev['stop'] else None, delta_color="off")
+        a4.metric("손익비", f"{ev['rr']:.1f}" if ev['rr'] is not None else "-",
+                  "기대수익 ÷ 위험", delta_color="off")
+        if ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
+            st.warning(f"⏳ **{int(ev['wait_price']):,}원 이하**로 내려오면 손익비·손절폭 조건을 충족해 매수할 수 있습니다.")
+        gap = (ev['target'] - ev['cur']) / ev['cur'] * 100 if ev['cur'] else 0
+        st.caption(f"증권사 목표가 {int(ev['target']):,}원 (괴리율 {gap:+.0f}%, 보통 12개월 기준) → 스윙은 목표 수익률 상한을 적용해 "
+                   f"{int(ev['target_eff']):,}원으로 계산했습니다.")
+
+    # ④ 강점 / 우려
     ranked = sorted([i for i in ev['items'] if i['max']], key=lambda i: i['pts'] / i['max'], reverse=True)
     good = [i for i in ranked if i['pts'] / i['max'] >= 0.7][:3]
     bad = [i for i in reversed(ranked) if i['pts'] / i['max'] <= 0.3][:3]
@@ -1245,43 +1494,22 @@ def render_stock_report(code, ev, d, tech):
         if not bad:
             st.markdown("- 뚜렷한 우려 항목 없음")
 
-    # 분류별 점수
-    p1, p2 = st.columns(2)
-    for n, (cat, (pts, mx)) in enumerate(ev['cats'].items()):
-        (p1 if n % 2 == 0 else p2).progress(pts / mx, text=f"{cat} {pts}/{mx}")
+    # ⑤ 세부 점수표 (분류별로 정렬, 신호등 평가)
+    st.markdown("**📋 세부 근거**")
+    cat_order = [c for c, _ in CATS]
+    st.dataframe(pd.DataFrame([{
+        '분류': i['cat'], '항목': i['label'], '값': i['detail'],
+        '평가': '🟢' if i['pts'] / i['max'] >= 0.7 else '🟡' if i['pts'] / i['max'] >= 0.4 else '🔴',
+        '점수': f"{i['pts']}/{i['max']}",
+    } for i in sorted(ev['items'], key=lambda i: cat_order.index(i['cat']))]), hide_index=True, width=1400)
 
-    # 핵심 수치 4열
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.markdown("**💰 밸류에이션**")
-        st.markdown(f"PER {fmt_num(d.get('PER'))} → 추정 {fmt_num(d.get('추정PER'))}  \n"
-                    f"업종 추정PER {fmt_num(d.get('업종PER'))}  \nPBR {fmt_num(d.get('PBR'), 2)}")
-    with k2:
-        st.markdown("**📈 성장·전망**")
-        gap = (ev['target'] - ev['cur']) / ev['cur'] * 100 if ev['cur'] else None
-        st.markdown(f"영업이익 {fmt_num(d.get('영업이익_직전'), 0)}→{fmt_num(d.get('영업이익_추정'), 0)}억  \n"
-                    f"EPS {fmt_num(d.get('EPS'), 0)}→{fmt_num(d.get('추정EPS'), 0)}  \n"
-                    f"목표가 {fmt_num(ev['target'], 0)}원 ({fmt_num(gap, 1, '%')})  \n의견 {fmt_num(d.get('의견평균'))}/5")
-    with k3:
-        st.markdown("**🏦 수익성·체력**")
-        st.markdown(f"영익률 {fmt_num(d.get('영업이익률'), 1, '%')}  \nROE {fmt_num(d.get('ROE'), 1, '%')}  \n"
-                    f"부채비율 {fmt_num(d.get('부채비율'), 0, '%')}")
-    with k4:
-        st.markdown("**🕒 기술·타이밍**")
-        dd = (1 - ev['cur'] / num['high6m']) * 100 if num.get('high6m') else None
-        st.markdown(f"추세 {tech.get('추세', '-')}  \nRSI {fmt_num(num.get('rsi'), 0)} · 스토캐스틱 {fmt_num(num.get('stoch_k'), 0)}  \n"
-                    f"볼린저 {fmt_num(num['bb_pct'] * 100, 0, '%') if num.get('bb_pct') is not None else '-'} · 6M 고점 대비 -{fmt_num(dd, 0, '%')}  \n"
-                    f"{tech.get('종합 시그널', '-')}")
-
-    # 수급 · 일정 · 목표가 추이
+    # ⑥ 수급 · 일정 · 목표가 추이
     e1, e2, e3 = st.columns(3)
+    fo, og = d.get('외인5일'), d.get('기관5일')
     with e1:
-        st.markdown("**🧾 수급 (최근 5거래일)**")
-        fo, og = d.get('외인5일'), d.get('기관5일')
-        if fo is None or og is None:
-            st.markdown("데이터 없음")
-        else:
-            st.markdown(f"외국인 {fo / 10000:+,.1f}만주  \n기관 {og / 10000:+,.1f}만주")
+        st.markdown("**🧾 수급 (5거래일)**")
+        st.markdown("데이터 없음" if fo is None or og is None
+                    else f"외국인 {fo / 10000:+,.1f}만주  \n기관 {og / 10000:+,.1f}만주")
     with e2:
         st.markdown("**📅 다음 일정**")
         ir = d.get('IR일정')
@@ -1301,42 +1529,8 @@ def render_stock_report(code, ev, d, tech):
         elif st.session_state.get('snap_error'):
             st.markdown("추적용 테이블이 없습니다 (README 참고)")
         else:
-            st.markdown("이력 쌓는 중 (날마다 추출하면 3회 후 판정)")
+            st.markdown("이력 쌓는 중  \n(서로 다른 날 3회 추출 후 판정)")
 
-    # 가격 계획
-    if ev.get('plan'):
-        plan = ev['plan']
-        a1, a2, a3 = st.columns(3)
-        a1.metric("현재가", f"{int(ev['cur']):,}원")
-        a2.metric("목표가(리포트 평균)", f"{int(ev['target']):,}원")
-        a3.metric("분할 완료 시 평단", f"{int(plan['avg']):,}원",
-                  f"상승여력 {plan['upside']:.0f}%" if plan['upside'] is not None else None, delta_color="off")
-        if ev['verdict'] == VERDICT_BUY:
-            st.markdown("**📐 분할 매수 계획** (직전 매수가보다 간격만큼 하락할 때만 다음 매수)")
-            st.dataframe(pd.DataFrame([
-                {'회차': f"{i}차", '매수가': int(p), '투입 비중(%)': round(w, 2)}
-                for i, (p, w) in enumerate(plan['tranches'], 1)
-            ]), hide_index=True)
-            st.info(f"🛑 **가격 손절 대신 재검토 조건**: ① {int(plan['review_below']):,}원 이하로 추가 하락 "
-                    "② 적자 전환/영업이익 급감 ③ 증권사 목표가 연속 하향 — 하나라도 해당하면 추가 매수를 멈추고 가설을 다시 점검합니다.")
-        elif ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
-            st.warning(f"💛 **{int(ev['wait_price']):,}원 부근**(6개월 고점 -15%)까지 내려오면 분할을 시작합니다.")
-    else:
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("현재가", f"{int(ev['cur']):,}원")
-        a2.metric("목표가(리포트 평균)", f"{int(ev['target']):,}원")
-        a3.metric("손절가", f"{int(ev['stop']):,}원" if ev['stop'] else "-",
-                  f"-{ev['loss_pct']:.1f}%" if ev['loss_pct'] else None, delta_color="off")
-        a4.metric("손익비", f"{ev['rr']:.1f}" if ev['rr'] is not None else "-")
-        if ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
-            st.warning(f"💛 **{int(ev['wait_price']):,}원 이하**로 내려오면 손익비·손절폭 규칙을 충족합니다.")
-        st.caption("ℹ️ 점수 = '좋은 종목인가'(밸류·성장·체력·타이밍), 손익비 = '지금 가격이 좋은가' — "
-                   "(목표가−현재가)÷(현재가−손절가). 2.0이면 위험 1을 감수하고 기대수익 2를 노린다는 뜻입니다.")
-
-    with st.expander("📋 점수 근거 상세 (항목별)"):
-        st.dataframe(pd.DataFrame([{
-            '분류': i['cat'], '항목': i['label'], '점수': f"{i['pts']}/{i['max']}", '근거': i['detail']
-        } for i in ev['items']]), hide_index=True, width=1400)
     reports = d.get('리포트목록') or []
     if reports:
         with st.expander("📰 최근 증권사 리포트"):
@@ -1344,7 +1538,6 @@ def render_stock_report(code, ev, d, tech):
                 st.markdown(f"- {r.get('일자', '')} · **{r.get('증권사', '')}** — {r.get('제목', '')}")
     st.markdown(f"[📊 네이버 증권 종합](https://m.stock.naver.com/domestic/stock/{code}/total) · "
                 f"[📈 차트](https://m.stock.naver.com/fchart/domestic/stock/{code})")
-
 
 @st.cache_data(ttl=600)
 def search_stocks(query):
@@ -1393,7 +1586,7 @@ def analyze_code(code, name=None, market=None):
     trend = target_trend(get_target_hist([code]).get(code))
     idx_dd = get_index_drawdowns() if mode == MODE_LONG else {}
     ev = evaluate(mode, basic['cur'], target if target else basic['cur'], int(d.get('리포트수') or 0),
-                  d, tech.get('_num'), idx_dd.get(market), RULES, trend=trend)
+                  d, tech.get('_num'), idx_dd.get(market), RULES, trend=trend, regime=MARKET_REGS.get(market))
     ev['trend'] = trend
     ev['name'] = name or basic.get('name') or code
     ev['market'] = market
@@ -1432,7 +1625,7 @@ def render_stock_search():
     if rep and rep['code'] == c['code']:
         if rep.get('mode') != mode:
             st.info(f"이 결과는 '{rep['mode']}' 모드로 계산됐습니다. 현재 모드({mode})로 보려면 다시 '종합 분석'을 누르세요.")
-        render_stock_report(rep['code'], rep['ev'], rep['d'], rep['tech'])
+        render_stock_report(rep['code'], rep['ev'], rep['d'], rep['tech'], MARKET_REGS.get(rep['ev']['market']))
         st.markdown("---")
         st.markdown("**📂 이 종목을 포트폴리오에 담기**")
         render_pick_form({rep['code']: rep['ev']}, f"search_{rep['code']}")
@@ -1456,11 +1649,12 @@ with h2:
 st.markdown(f"##### `{APP_VERSION}` · Investment Strategy Dashboard")
 
 st.info("""
-**📌 목적** — 한경 컨센서스 신규 리포트 중 저평가 종목을 찾아 **점수(100점)로 근거를 보여주고**, 선정한 종목을 포트폴리오에 저장
-**📌 사용법** — 🔥 핫픽: 추출 → 판정 탭에서 종목 체크(여러 개 가능) → 종합 리포트 확인 → 컨셉과 함께 담기 · 🔍 종목 분석: 아무 종목이나 검색해 한 화면 요약 · 📂 포트폴리오: 컨셉별 관리  
-**📌 활용** — 본 도구는 의사결정 보조용이며, 모든 매매 책임은 사용자에게 있음
+### 👉 이렇게 쓰세요
+**① 시장 확인**: 아래 🌐 시장 신호가 🔴이면 오늘은 신규 매수를 쉽니다
+**② 🔥 오늘의 핫픽** 탭 → **[🚀 오늘의 핫픽 추출]** → 표에서 종목 체크 → 종합 리포트 확인
+**③ 마음에 들면 컨셉을 적고 [📂 포트폴리오에 담기]** → **📂 내 관심종목** 탭에서 관리
+🔍 **종목 분석** 탭: 아무 종목이나 검색해서 같은 리포트를 볼 수 있습니다 · 모든 투자 책임은 본인에게 있습니다
 """)
-st.markdown("---")
 
 st.sidebar.markdown("### ⚙️ 설정")
 period_option = st.sidebar.selectbox(
@@ -1494,8 +1688,13 @@ min_score = st.sidebar.slider("최소 종합 점수 (100점)", 30, 90, 60,
 earn_wait = st.sidebar.slider("실적 발표 N일 전엔 대기", 0, 10, 5,
                              help="실적 발표가 N일 이내면 점수가 높아도 '대기'로 판정 (0=사용 안 함)")
 RULES = {'min_score': min_score, 'min_rr': 2.0, 'max_loss': 10,
-         'n_split': 3, 'split_step': 7, 'max_weight': 5, 'earn_wait': earn_wait}
+         'n_split': 3, 'split_step': 7, 'max_weight': 5, 'earn_wait': earn_wait,
+         'swing_cap': 20, 'mkt_gate': False}
 if mode == MODE_SWING:
+    RULES['swing_cap'] = st.sidebar.slider("스윙 목표 수익률 상한 (%)", 5, 50, 20,
+                                           help="증권사 목표가는 보통 12개월 기준이라, 1주~1달 스윙에는 이 수익률까지만 기대수익으로 계산")
+    RULES['mkt_gate'] = st.sidebar.checkbox("시장 하락 지속(🔴)일 땐 신규 매수 보류", value=True,
+                                            help="지수가 하락 추세이고 반등이 약하면 💚도 💛 대기로 바꿉니다 (스윙 모드)")
     RULES['min_rr'] = st.sidebar.slider("최소 손익비", 1.0, 4.0, 2.0, 0.5,
                                         help="(목표가-현재가)/(현재가-손절가). 미달이면 '대기'")
     RULES['max_loss'] = st.sidebar.slider("최대 손절폭 (%)", 3, 20, 10,
@@ -1507,6 +1706,9 @@ else:
     RULES['max_weight'] = st.sidebar.slider("종목당 최대 투입 비중 (%)", 1, 20, 5,
                                             help="전체 투자금 대비. 분할 횟수로 균등 배분")
 
+
+MARKET_REGS = render_market_banner() or {}      # {'KOSPI': (신호등, 라벨, 조언), 'KOSDAQ': ...}
+st.markdown("---")
 
 main_tabs = st.tabs(["🔥 오늘의 핫픽", "🔍 종목 분석", "📂 내 관심종목"])
 
@@ -1688,44 +1890,16 @@ with main_tabs[0]:
                     continue
                 ev = evaluate(mode, float(r0['현재가']), float(cons['mean']), int(cons['count']),
                               details_map.get(code, {}), tech_signals.get(code, {}).get('_num'),
-                              idx_dd.get(r0['시장']), RULES, trend=target_trend(hist_map.get(code)))
+                              idx_dd.get(r0['시장']), RULES, trend=target_trend(hist_map.get(code)),
+                              regime=MARKET_REGS.get(r0['시장']))
                 ev['name'] = r0['종목명_x']; ev['market'] = r0['시장']
                 ev['trend'] = target_trend(hist_map.get(code))
                 verdicts[code] = ev
 
             st.success(f"✅ 오늘의 핫픽 {len(hot_picks)}건 ({len(verdicts)}종목) 추출 완료")
 
-            with st.expander("📖 **판정 기준 · 지표 해석 가이드** — 클릭해서 펼쳐보기", expanded=False):
-                st.markdown("""
-                ### 🎯 종합 점수 (100점) — 항목별 가중치가 다릅니다
-                | 분류 | 배점 | 보는 것 | 왜 이 비중인가 |
-                |---|---|---|---|
-                | **밸류에이션** | 25 | 추정PER(포워드)을 동일업종 중앙값과 비교, PBR | 가격이 싼가 — 미래 이익 기준 |
-                | **성장·전망** | 35 | 영업이익·EPS 추정 성장, 목표가 괴리율, 애널리스트 의견 | 주가는 미래 이익을 따라감 → 가장 큰 비중 |
-                | **수익성·체력** | 20 | 영익률 또는 ROE(대기업 고려해 8%/10%를 양호로), 부채비율 | 망하지 않을 회사인가 |
-                | **타이밍** | 20 | 스윙: 추세·볼린저·RSI+스토캐스틱 이중확인·**수급** / 중장기: 눌림·하락원인·이중확인·**수급** | 과거 지표라 비중을 낮춤 |
-
-                - **이중 확인**: RSI와 스토캐스틱이 *동시에* 과매도일 때만 만점 (하나만 낮으면 부분점수)
-                - **수급**: 최근 5거래일 외국인·기관 순매수 — 둘 다 사면 만점, 둘 다 팔면 0점
-                - **하드 게이트**: 영업이익 적자 전망은 점수와 무관하게 ⚪ 제외 / 중장기 모드는 '개별 악재' 의심 시 제외
-                - **이벤트 게이트(→ 💛 대기)**: 실적 발표 N일 이내 · 목표가 3회 연속 하향(날마다 저장되는 스냅샷 기준, Supabase 테이블 필요)
-                - **후보 필터**: 스팩·우선주·소형주(기본 시총 1,000억 미만)는 후보에서 제외 (사이드바)
-                - **점수 vs 손익비**: 점수는 *좋은 종목인가*, 손익비는 *지금 가격이 좋은가*.
-                  손익비 = (목표가−현재가)÷(현재가−손절가). 스윙 모드에서 점수가 높아도 손익비가 낮으면 💛 대기
-                - 판정: **💚 매수 적정** = 점수 통과 + 가격 조건 통과 · **💛 대기** = 점수는 통과, 가격·추세 불리 · **⚪ 제외** = 점수 미달/게이트
-
-                ### 🚦 보조 신호등 (표의 '신호' 열: 괴리율·PER·PBR·영익률 순)
-                💚 좋음 / 💛 보통 / ❤️ 주의 / ➖ 데이터 없음. 추출 표의 숫자 열은 **정렬이 정확**하도록 숫자로만 표시됩니다.
-
-                ### 📈 기술적 종합 시그널 (📈 탭)
-                - **💚 매수 고려** = 추세 상승 + 볼린저 하단 · **❤️ 진입 보류** = 추세 하락 OR (RSI 과매수 + 볼린저 상단) · **💛 관망** = 그 외
-                """)
-
-            # 탭 분리
-            # 판정 화면이 기본, 원본 표(펀더멘털·기술)는 종합 리포트와 중복되므로 접어 둠
-            tab0 = st.container()
-            with st.expander("📊 원본 표 보기 (펀더멘털 · 기술적 분석)"):
-                tab1, tab2 = st.tabs(["📊 펀더멘털", "📈 기술적"])
+            # 탭 분리: 판정(결론) → 펀더멘털 → 기술적
+            tab0, tab1, tab2 = st.tabs(["🎯 매수 판정", "📊 펀더멘털 분석", "📈 기술적 분석"])
 
             with tab0:
                 if mode == MODE_LONG:
@@ -1749,11 +1923,12 @@ with main_tabs[0]:
                     rows.append({
                         '종목코드': code, '종목명': ev['name'], '시장': ev['market'],
                         '판정': ev['verdict'], '점수': ev['score'],
-                        '밸류': ev['cats']['밸류에이션'][0], '성장': ev['cats']['성장·전망'][0],
-                        '체력': ev['cats']['수익성·체력'][0], '타이밍': ev['cats']['타이밍'][0],
-                        '현재가': int(ev['cur']), '목표가': int(ev['target']),
-                        '재검토가': int(ev['wait_price']) if ev['verdict'] == VERDICT_WAIT and ev['wait_price'] else None,
-                        '손절가': int(ev['stop']) if ev['stop'] else None,
+                        '밸류': ev['cat_pct']['밸류에이션'], '성장': ev['cat_pct']['성장·전망'],
+                        '체력': ev['cat_pct']['수익성·체력'], '타이밍': ev['cat_pct']['타이밍'],
+                        '현재가': int(ev['cur']),
+                        '매수 가능가': int(ev['wait_price']) if ev['verdict'] == VERDICT_WAIT and ev['wait_price'] else None,
+                        '기대수익(%)': round(ev['upside_pct'], 0) if ev.get('upside_pct') is not None else None,
+                        '위험(%)': round(-ev['loss_pct'], 1) if ev['loss_pct'] else None,
                         '손익비': round(ev['rr'], 1) if ev['rr'] is not None else None,
                         '평단(분할)': int(ev['plan']['avg']) if ev.get('plan') and ev['verdict'] == VERDICT_BUY else None,
                         '사유': ev['reason'],
@@ -1771,7 +1946,7 @@ with main_tabs[0]:
                     m4.metric("점수 분포", f"최고 {scores[-1]}", f"중앙 {scores[len(scores) // 2]}", delta_color="off")
                 if n_buy == 0:
                     st.info("오늘은 규칙을 통과한 종목이 없습니다. **안 사는 것도 결정입니다.** "
-                            "💛 대기 종목은 '재검토가'까지 내려오면 다시 보세요.")
+                            "💛 대기 종목은 '매수 가능가'까지 내려오면 다시 보세요.")
 
                 # 필터: 같은 성격끼리 모아 보기
                 f1, f2, f3 = st.columns(3)
@@ -1792,17 +1967,20 @@ with main_tabs[0]:
                         vdf_view, hide_index=True, width=1400,
                         column_config={
                             "점수": st.column_config.ProgressColumn("점수", min_value=0, max_value=100, format="%d"),
-                            "밸류": st.column_config.NumberColumn("밸류", help="25점 만점", format="%d"),
-                            "성장": st.column_config.NumberColumn("성장", help="35점 만점", format="%d"),
-                            "체력": st.column_config.NumberColumn("체력", help="20점 만점", format="%d"),
-                            "타이밍": st.column_config.NumberColumn("타이밍", help="20점 만점", format="%d"),
+                            "밸류": st.column_config.ProgressColumn("밸류", min_value=0, max_value=100, format="%d%%",
+                                                                  help="70%↑ 상 · 40~70% 중 · 40%↓ 하"),
+                            "성장": st.column_config.ProgressColumn("성장", min_value=0, max_value=100, format="%d%%"),
+                            "체력": st.column_config.ProgressColumn("체력", min_value=0, max_value=100, format="%d%%"),
+                            "타이밍": st.column_config.ProgressColumn("타이밍", min_value=0, max_value=100, format="%d%%"),
                             "현재가": st.column_config.NumberColumn("현재가", format="%,d"),
-                            "재검토가": st.column_config.NumberColumn("재검토가", format="%,d",
-                                                                  help="이 가격 이하에서 규칙을 충족"),
-                            "목표가": st.column_config.NumberColumn("목표가", format="%,d"),
-                            "손절가": st.column_config.NumberColumn("손절가", format="%,d"),
+                            "매수 가능가": st.column_config.NumberColumn("매수 가능가", format="%,d",
+                                                                    help="💛 대기 종목이 이 가격 이하로 내려오면 조건 충족"),
+                            "기대수익(%)": st.column_config.NumberColumn("기대수익(%)", format="%d",
+                                                                    help="스윙은 목표 수익률 상한 적용, 중장기는 증권사 목표가 기준"),
+                            "위험(%)": st.column_config.NumberColumn("위험(%)", format="%.1f",
+                                                                  help="현재가에서 손절가까지 하락률"),
                             "손익비": st.column_config.NumberColumn("손익비", format="%.1f",
-                                                                 help="(목표가-현재가)÷(현재가-손절가)"),
+                                                                 help="기대수익 ÷ 위험"),
                             "평단(분할)": st.column_config.NumberColumn("평단(분할)", format="%,d",
                                                                     help="분할매수 완료 시 예상 평균단가"),
                         },
@@ -1822,7 +2000,7 @@ with main_tabs[0]:
                         ev = verdicts[c]
                         with st.expander(f"📌 {ev['name']} · {ev['market']} — {ev['verdict']} · {ev['score']}점",
                                          expanded=(j == 0)):
-                            render_stock_report(c, ev, details_map.get(c), tech_signals.get(c))
+                            render_stock_report(c, ev, details_map.get(c), tech_signals.get(c), MARKET_REGS.get(ev['market']))
 
                     st.markdown("**📂 선택한 종목을 포트폴리오에 담기** (컨셉과 함께 저장)")
                     render_pick_form({c: verdicts[c] for c in codes}, f"picks_{rn}")
@@ -1948,6 +2126,42 @@ with main_tabs[0]:
                         if chart_url:
                             st.markdown(f"[📈 네이버 차트 보기]({chart_url})")
                         st.markdown("---")
+
+            with st.expander("📖 판정 기준 · 용어 설명 (맨 아래)", expanded=False):
+                st.markdown("""
+                ### 🎯 판정은 3단계로 정해집니다
+                1. **종합 점수(100점)** — 종목의 질. 기준(사이드바, 기본 60점) 미만이면 ⚪ 제외
+                2. **가격·시장 조건** — 점수가 통과해도 아래 중 하나라도 걸리면 💛 대기
+                   - 스윙: 손익비 부족, 손절폭 과다, 추세 하락, 과열 / 중장기: 아직 충분히 안 눌림
+                   - 실적 발표 N일 전, 목표가 3회 연속 하향, 시장 하락 지속(🔴, 스윙 모드)
+                3. 모두 통과하면 💚 매수 적정
+
+                ### 📊 종합 점수 구성 (100점) — 표에서는 분류별 %와 상/중/하로 표시
+                | 분류 | 배점 | 보는 것 |
+                |---|---|---|
+                | **밸류에이션** | 25 | 추정PER(포워드)을 동일업종 중앙값과 비교, PBR |
+                | **성장·전망** | 35 | 영업이익·EPS 추정 성장, 목표가 괴리율, 애널리스트 의견 (미래 지표라 비중 최대) |
+                | **수익성·체력** | 20 | 영업이익률 또는 ROE(대기업 고려해 8%/10%를 양호로), 부채비율 |
+                | **타이밍** | 20 | 스윙: 추세·볼린저·RSI+스토캐스틱 이중확인·수급 / 중장기: 눌림·하락원인·이중확인·수급 |
+                - **상/중/하**: 득점률 70% 이상 🟢 상 · 40~70% 🟡 중 · 40% 미만 🔴 하
+                - **이중 확인**: RSI와 스토캐스틱이 *동시에* 과매도일 때만 만점
+                - **수급**: 최근 5거래일 외국인·기관 순매수 (둘 다 사면 만점)
+                - **하드 게이트**: 영업이익 적자 전망은 점수와 무관하게 ⚪ 제외 / 중장기는 '개별 악재' 의심 시 제외
+
+                ### 💡 용어
+                - **괴리율** = (증권사 목표가 − 현재가) ÷ 현재가. 목표가까지 *얼마나 남았나* (보통 12개월 기준)
+                - **기대수익** = 스윙 모드에서 괴리율에 **목표 수익률 상한(기본 20%)**을 씌운 값. 1주~1달 보유에 현실적인 목표
+                - **감수할 위험** = 현재가에서 손절가까지 하락률 (손절가 = 최근 20일 저가 −2%)
+                - **손익비** = 기대수익 ÷ 감수할 위험. 2.0이면 "1을 잃을 각오로 2를 노린다". 괴리율은 *얼마나 오를 수 있나*, 손익비는 *위험 대비 남는 장사인가*
+                - **매수 가능가** = 💛 대기 종목이 *이 가격 이하로 내려오면 조건을 충족*한다는 가격 (지금 사지 말고 기다릴 기준선)
+
+                ### 🌐 시장 신호 (화면 맨 위)
+                - 지수(코스피·코스닥)의 20일선·60일선·반등 폭으로 판단: 🟢 상승 추세 / 🟡 추세 전환 시도·반등 강함·반등 약함·횡보 / 🔴 하락 지속
+                - 환율·유가·미 금리·VIX가 급변하면 어떤 업종에 유리/불리한지 규칙 기반으로 설명
+                - 🔴일 때 스윙 모드는 신규 매수 보류(사이드바에서 끌 수 있음). 중장기 분할매수는 하락장이 오히려 기회라 적용 안 함
+
+                ### 🚦 표의 '신호' 열 (펀더멘털 탭): 괴리율·PER·PBR·영익률 순 💚좋음 💛보통 ❤️주의 ➖없음
+                """)
 
             csv_cols = ['작성일', '종목명_x', '시장', '현재가', '등락률', '적정가격', '괴리율(%)', '시총(억)', 'PER', '추정PER', 'PBR', '영익률(%)', 'ROE(%)', '신호', '매출액', '영업이익', 'RSI', '볼린저(%)', '추세', '종합 시그널', '근거', '차트', '투자의견', '작성기관', '리포트제목', 'PDF링크']
             csv_df = hot_picks[[c for c in csv_cols if c in hot_picks.columns]].rename(columns={'종목명_x': '종목명'})
