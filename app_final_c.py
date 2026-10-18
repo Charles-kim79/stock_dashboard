@@ -7,7 +7,7 @@ import re
 import time
 import hmac
 
-APP_VERSION = "v1.8"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
+APP_VERSION = "v1.9"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
 
 try:
     import yfinance as yf
@@ -309,7 +309,7 @@ def get_stock_details(code):
             details['목표주가'] = _f(ci.get('priceTargetMean'))
             rs = data.get('researches') or []
             details['리포트수'] = len(rs)
-            details['리포트목록'] = [{'제목': r.get('tit'), '증권사': r.get('bnm'), '일자': r.get('wdt')}
+            details['리포트목록'] = [{'제목': r.get('tit'), '증권사': r.get('bnm'), '일자': r.get('wdt'), 'id': r.get('id')}
                                   for r in rs[:5]]
             # 수급: 최근 5거래일 외국인·기관 순매수 수량 합 (최신순 목록)
             deals = (data.get('dealTrendInfos') or [])[:5]
@@ -1611,7 +1611,7 @@ def render_pick_form(evs, key):
             st.error(' / '.join(failed))
 
 
-def render_stock_report(code, ev, d, tech):
+def render_stock_report(code, ev, d, tech, reports=None):
     """종목 1개 종합 리포트 — ①결론 ②4분류 상/중/하 ③가격계획 ④강점·우려 ⑤세부 점수표 ⑥수급·일정·목표가추이"""
     d = d or {}
     tech = tech or {}
@@ -1661,6 +1661,31 @@ def render_stock_report(code, ev, d, tech):
         gap = (ev['target'] - ev['cur']) / ev['cur'] * 100 if ev['cur'] else 0
         st.caption(f"증권사 목표가 {int(ev['target']):,}원 (괴리율 {gap:+.0f}%, 보통 12개월 기준) → 스윙은 목표 수익률 상한을 적용해 "
                    f"{int(ev['target_eff']):,}원으로 계산했습니다.")
+
+    # 증권사 목표가: 핫픽은 한경 리포트별 목표가·의견·PDF, 검색 종목은 네이버 컨센서스 평균
+    st.markdown("**🎯 증권사 목표가**")
+    if reports:
+        rdf = pd.DataFrame(reports)
+        tg = pd.to_numeric(rdf['목표가'], errors='coerce')
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("평균 목표가", f"{tg.mean():,.0f}원", f"{(tg.mean() / ev['cur'] - 1) * 100:+.0f}%", delta_color="off")
+        t2.metric("최고", f"{tg.max():,.0f}원", f"{(tg.max() / ev['cur'] - 1) * 100:+.0f}%", delta_color="off")
+        t3.metric("최저", f"{tg.min():,.0f}원", f"{(tg.min() / ev['cur'] - 1) * 100:+.0f}%", delta_color="off")
+        t4.metric("리포트 수", f"{len(rdf)}건")
+        rdf['괴리율(%)'] = ((tg / ev['cur'] - 1) * 100).round(0)
+        st.dataframe(rdf[['일자', '증권사', '목표가', '괴리율(%)', '의견', '제목', '리포트']], hide_index=True, width=1400,
+                     column_config={
+                         '목표가': st.column_config.NumberColumn('목표가', format="%,d"),
+                         '괴리율(%)': st.column_config.NumberColumn('괴리율(%)', format="%d"),
+                         '리포트': st.column_config.LinkColumn('리포트', display_text='📄 PDF'),
+                     })
+    else:
+        gap_c = (ev['target'] - ev['cur']) / ev['cur'] * 100 if ev['cur'] else 0
+        rec = d.get('의견평균')
+        st.markdown(f"컨센서스 평균 목표가 **{int(ev['target']):,}원** ({gap_c:+.0f}%)"
+                    + (f" · 투자의견 평균 {rec:.1f}/5" if rec else "")
+                    + f" · 리포트 {int(d.get('리포트수') or 0)}건")
+        st.caption("증권사별 목표가·PDF는 한경 컨센서스 리포트가 있는 '🚀 오늘의 핫픽' 종목에서 표로 제공됩니다.")
 
     # ④ 강점 / 우려
     ranked = sorted([i for i in ev['items'] if i['max']], key=lambda i: i['pts'] / i['max'], reverse=True)
@@ -1766,7 +1791,9 @@ def render_stock_report(code, ev, d, tech):
     if reports:
         with st.expander("📰 최근 증권사 리포트"):
             for r in reports:
-                st.markdown(f"- {r.get('일자', '')} · **{r.get('증권사', '')}** — {r.get('제목', '')}")
+                link = (f"https://finance.naver.com/research/company_read.naver?nid={r['id']}" if r.get('id') else None)
+                title = f"[{r.get('제목', '')}]({link})" if link else r.get('제목', '')
+                st.markdown(f"- {r.get('일자', '')} · **{r.get('증권사', '')}** — {title}")
     st.markdown(f"[📊 네이버 증권 종합](https://m.stock.naver.com/domestic/stock/{code}/total) · "
                 f"[📈 차트](https://m.stock.naver.com/fchart/domestic/stock/{code})")
 
@@ -1867,16 +1894,7 @@ def render_stock_search():
 # =========================
 rn = st.session_state.get('reset_n', 0)   # '처음으로'/'선택 해제' 시 증가 → 표 선택 상태 초기화용 키
 
-h1, h2 = st.columns([4, 1])
-with h1:
-    st.title("🎯 AI 투자 전략 엔진")
-with h2:
-    st.write("")
-    if st.button("🏠 처음으로", help="추출 결과와 선택 상태를 모두 초기화"):
-        st.session_state.pop('result', None)
-        st.session_state.pop('search_res', None)
-        st.session_state['reset_n'] = rn + 1
-        st.rerun()
+st.title("🎯 AI 투자 전략 엔진")
 st.markdown(f"##### `{APP_VERSION}` · Investment Strategy Dashboard")
 
 
@@ -1939,7 +1957,15 @@ with page_tabs[1]:
     with screen_tabs[0]:
         # ---------- 1) 수집·계산: 버튼 클릭 시에만 실행, 결과는 session_state에 보관 ----------
         # (표 행 클릭 등으로 재실행돼도 결과가 사라지지 않도록 렌더링과 분리)
-        if st.button('🚀 오늘의 핫픽 추출', type="primary", key="extract_btn"):
+        bc1, bc2 = st.columns([3, 1])
+        run_extract = bc1.button('🚀 오늘의 핫픽 추출', type="primary", key="extract_btn")
+        if bc2.button("🔄 스크리닝 초기화", key="reset_screen",
+                      help="추출 결과·체크한 종목·필터·검색 내용을 모두 지우고 처음 상태로"):
+            st.session_state.pop('result', None)
+            st.session_state.pop('search_res', None)
+            st.session_state['reset_n'] = rn + 1
+            st.rerun()
+        if run_extract:
             progress = st.progress(0)
             status = st.empty()
 
@@ -2006,7 +2032,7 @@ with page_tabs[1]:
                 consensus = (matched.groupby('종목코드')['적정가격']
                              .agg(['mean', 'count']).to_dict('index'))
 
-                tech_signals, diag_sample, details_map, hist_map = {}, None, {}, {}
+                tech_signals, diag_sample, details_map, hist_map, reports_map = {}, None, {}, {}, {}
                 if not hot_picks.empty:
                     unique_items = hot_picks[['종목코드', '시장']].drop_duplicates().to_dict('records')
 
@@ -2025,6 +2051,14 @@ with page_tabs[1]:
                     snapshot_targets([{'code': c, 'target': dd.get('목표주가'), 'n_reports': dd.get('리포트수'),
                                        'recomm': dd.get('의견평균')} for c, dd in details_map.items()])
                     hist_map = get_target_hist(list(details_map.keys()))
+
+                    # 종목별 증권사 리포트(목표가·의견·PDF) — 종합 리포트의 '증권사 목표가' 표에 사용
+                    for item in unique_items:
+                        c = item['종목코드']
+                        sub = matched[matched['종목코드'] == c].sort_values('작성일', ascending=False)
+                        reports_map[c] = [{'일자': r['작성일'], '증권사': r['작성기관'], '목표가': r['적정가격'],
+                                           '의견': r['투자의견'], '제목': r['리포트제목'], '리포트': r['PDF링크']}
+                                          for _, r in sub.iterrows()]
 
                     # 정렬이 정확하도록 숫자는 숫자 열로, 이모지는 별도 '신호' 열로 분리
                     num_cols = {k: [] for k in ('PER', '추정PER', 'PBR', '영익률(%)', 'ROE(%)', 'RSI', '볼린저(%)')}
@@ -2074,7 +2108,7 @@ with page_tabs[1]:
                     'hot_picks': hot_picks, 'consensus': consensus,
                     'details_map': details_map, 'tech_signals': tech_signals,
                     'diag_sample': diag_sample, 'n_reports': len(research_df), 'hist_map': hist_map,
-                    'n_filtered': n_filtered,
+                    'n_filtered': n_filtered, 'reports_map': reports_map,
                     'n_matched': len(matched), 'threshold': threshold,
                     'period': period_option, 'at': datetime.now().strftime('%Y-%m-%d %H:%M'),
                 }
@@ -2086,6 +2120,7 @@ with page_tabs[1]:
             consensus, details_map, tech_signals = res['consensus'], res['details_map'], res['tech_signals']
             diag_sample, matched_n = res['diag_sample'], res['n_matched']
             hist_map = res.get('hist_map', {})
+            reports_map = res.get('reports_map', {})
 
             if res.get('n_filtered'):
                 st.caption(f"🧹 스팩·우선주·소형주 필터로 {res['n_filtered']}종목을 후보에서 제외했습니다 (사이드바에서 조정)")
@@ -2222,7 +2257,7 @@ with page_tabs[1]:
                             ev = verdicts[c]
                             with st.expander(f"📌 {ev['name']} · {ev['market']} — {ev['verdict']} · {ev['score']}점",
                                              expanded=(j == 0)):
-                                render_stock_report(c, ev, details_map.get(c), tech_signals.get(c))
+                                render_stock_report(c, ev, details_map.get(c), tech_signals.get(c), reports_map.get(c))
 
                         st.markdown("**📂 선택한 종목을 포트폴리오에 담기** (컨셉과 함께 저장)")
                         render_pick_form({c: verdicts[c] for c in codes}, f"picks_{rn}")
