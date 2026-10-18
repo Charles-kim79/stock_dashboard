@@ -7,7 +7,7 @@ import re
 import time
 import hmac
 
-APP_VERSION = "v1.4"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
+APP_VERSION = "v1.5"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
 
 try:
     import yfinance as yf
@@ -867,7 +867,6 @@ def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
 #   status: 'watch'(관심·Pick) → 'open'(매수 확정) → 'closed'(청산)
 # =========================
 BUCKETS = ['국내 단기·중기', '국내 장기(배당)', '해외 성장']
-OUTCOMES = ['목표 달성 후 매도', '손절·재검토 후 정리', '계획 없이 임의 청산']
 
 
 def _sb():
@@ -995,7 +994,6 @@ def delete_plan(plan_id):
         return False, f"삭제 실패: {type(e).__name__} - {e}"
 
 
-THESES = ['저평가 가치', '실적 성장', '배당·인컴', '턴어라운드', '테마·모멘텀', '기타']
 
 
 def build_pick_record(code, ev, bucket, thesis='', theme='', note=''):
@@ -1045,171 +1043,137 @@ def plan_status(p, price):
     return f"보유 중 ({ret:+.1f}%)"
 
 
-def _days_since(created_at):
-    try:
-        return (datetime.now().date() - datetime.strptime(str(created_at)[:10], '%Y-%m-%d').date()).days
-    except Exception:
-        return None
+
+STATUS_LABEL = {'watch': '관심', 'open': '보유', 'closed': '종료'}
+LABEL_STATUS = {v: k for k, v in STATUS_LABEL.items()}
+
+
+def _norm(v):
+    """표 편집 전후 비교용: None/NaN → 빈 문자열"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ''
+    return str(v).strip()
 
 
 def render_portfolio():
-    """📂 내 포트폴리오: 관심(Pick) + 컨셉(구분·관점·테마) 중심. 매수/매도 가격 기록은 가볍게(선택)"""
-    st.subheader("📂 내 포트폴리오")
-    st.caption("종목을 **어떤 컨셉으로 담았는지**(구분·관점·테마)를 함께 저장해, 컨셉별로 옥석을 가려봅니다. "
-               "실제 매수·매도 내역은 본인 기록을 쓰고, 여기서는 '왜 담았나'와 '지금 가설이 유효한가'에 집중합니다.")
+    """📂 내 관심종목: 표 하나에서 상태·구분·컨셉·메모를 바로 수정하고 저장"""
+    st.subheader("📂 내 관심종목")
+    st.caption("표에서 **상태·구분·컨셉·메모**를 직접 고친 뒤 '💾 변경 저장'을 누르세요. "
+               "상태를 '보유'로 바꾸려면 메모에 **매수 이유(10자 이상)**가 있어야 합니다. 삭제는 체크 후 저장.")
     if not _sb():
         st.warning("⚠️ 저장소 미연결 — 지금은 이 브라우저 세션에만 저장돼 새로고침하면 사라집니다. "
-                   "영구 저장은 README의 'Supabase 연결' 3단계를 따라 Secrets에 키를 넣으세요.")
-    plans = get_plans()
+                   "README의 'Supabase 연결'을 따라 Secrets에 키를 넣으세요.")
+    plans = [p for p in get_plans() if p.get('status') in STATUS_LABEL]
+    if not plans:
+        st.info("아직 담은 종목이 없습니다. 🔥 오늘의 핫픽이나 🔍 종목 분석에서 '📂 포트폴리오에 담기'를 누르세요.")
+        return
 
     def meta_of(p):
         return p.get('plan') or {}
 
-    def bucket_of(p):
-        return meta_of(p).get('bucket', BUCKETS[0])
+    # 필터: 기본값은 '전체' (새 컨셉을 담아도 목록에서 사라지지 않음)
+    themes = sorted({meta_of(p).get('theme') or '(미지정)' for p in plans})
+    f1, f2 = st.columns([3, 2])
+    f_status = f1.radio("상태", ['전체', '관심', '보유', '종료'], horizontal=True, key="pf_f_status")
+    f_theme = f2.selectbox("컨셉", ['전체'] + themes, key="pf_f_theme")
 
-    def theme_of(p):
-        return meta_of(p).get('theme') or '(미지정)'
+    rows, by_id = [], {}
+    for p in plans:
+        m = meta_of(p)
+        label = STATUS_LABEL[p['status']]
+        theme = m.get('theme') or '(미지정)'
+        if (f_status != '전체' and label != f_status) or (f_theme != '전체' and theme != f_theme):
+            continue
+        price = get_last_price(p['code'], p['market']) if p['status'] != 'closed' else None
+        by_id[p['id']] = p
+        rows.append({
+            '삭제': False, 'ID': p['id'], '종목': p['name'], '상태': label,
+            '구분': m.get('bucket', BUCKETS[0]), '컨셉': m.get('theme') or '',
+            '메모': m.get('note') or p.get('reason') or '',
+            '담은가': p['entry_price'], '현재가': int(price) if price else None,
+            '변화(%)': round((price / p['entry_price'] - 1) * 100, 1) if price else None,
+            '목표가': p['target_price'], '손절가': p.get('stop_price'),
+            '점수': m.get('score'), '알림': plan_status(p, price) if p['status'] != 'closed' else '',
+        })
 
-    all_themes = sorted({theme_of(p) for p in plans if p.get('status') in ('watch', 'open')})
-    f1, f2 = st.columns(2)
-    sel_b = f1.multiselect("구분 필터", BUCKETS, default=BUCKETS, key="pf_bucket_filter")
-    sel_t = f2.multiselect("테마 필터", all_themes, default=all_themes, key="pf_theme_filter")
+    if not rows:
+        st.caption("조건에 맞는 종목이 없습니다.")
+        return
 
-    def keep(p):
-        return bucket_of(p) in sel_b and (theme_of(p) in sel_t or not all_themes)
+    df = pd.DataFrame(rows).dropna(axis=1, how='all')
+    ver = st.session_state.get('pf_ver', 0)
+    locked = [c for c in df.columns if c not in ('삭제', '상태', '구분', '컨셉', '메모')]
+    edited = st.data_editor(
+        df, hide_index=True, width=1400, disabled=locked,
+        key=f"pf_editor_{ver}_{f_status}_{f_theme}",
+        column_config={
+            '삭제': st.column_config.CheckboxColumn('삭제', width='small'),
+            '상태': st.column_config.SelectboxColumn('상태', options=list(LABEL_STATUS.keys()), required=True),
+            '구분': st.column_config.SelectboxColumn('구분', options=BUCKETS, required=True),
+            '컨셉': st.column_config.TextColumn('컨셉', help="섹터·테마 (예: AI반도체, 배당주)"),
+            '메모': st.column_config.TextColumn('메모', help="왜 담았나 / 매수 이유", width='large'),
+            '담은가': st.column_config.NumberColumn('담은가', format="%,d"),
+            '현재가': st.column_config.NumberColumn('현재가', format="%,d"),
+            '변화(%)': st.column_config.NumberColumn('변화(%)', format="%.1f"),
+            '목표가': st.column_config.NumberColumn('목표가', format="%,d"),
+            '손절가': st.column_config.NumberColumn('손절가', format="%,d"),
+        })
 
-    watch = [p for p in plans if p.get('status') == 'watch' and keep(p)]
-    open_p = [p for p in plans if p.get('status') == 'open' and keep(p)]
-    closed_p = [p for p in plans if p.get('status') == 'closed' and keep(p)]
+    if st.button("💾 변경 저장", type="primary", key="pf_save"):
+        orig = {r['ID']: r for r in rows}
+        done, errors = 0, []
+        for _, r in edited.iterrows():
+            pid = int(r['ID'])
+            o, p = orig[pid], by_id[pid]
+            if r['삭제']:
+                ok_, msg = delete_plan(pid)
+                done += ok_
+                if not ok_:
+                    errors.append(f"{r['종목']}: {msg}")
+                continue
+            if all(_norm(r[k]) == _norm(o[k]) for k in ('상태', '구분', '컨셉', '메모')):
+                continue
+            new_status = LABEL_STATUS[r['상태']]
+            theme, note = _norm(r['컨셉']), _norm(r['메모'])
+            if not theme:
+                errors.append(f"{r['종목']}: 컨셉을 입력하세요")
+                continue
+            if new_status == 'open' and p['status'] != 'open' and len(note) < 10:
+                errors.append(f"{r['종목']}: '보유'로 바꾸려면 메모에 매수 이유를 10자 이상 적으세요")
+                continue
+            meta = dict(meta_of(p))
+            meta.update({'bucket': r['구분'], 'theme': theme, 'note': note})
+            fields = {'plan': meta, 'status': new_status}
+            if new_status == 'open' and p['status'] != 'open':
+                fields['reason'] = note
+                fields['exception'] = meta.get('verdict') != VERDICT_BUY     # 규칙 미통과 종목을 산 경우 표시
+            if new_status == 'closed' and not p.get('closed_at'):
+                fields['closed_at'] = datetime.now().isoformat()
+            ok_, msg = update_plan(pid, fields)
+            done += ok_
+            if not ok_:
+                errors.append(f"{r['종목']}: {msg}")
+        for e in errors:
+            st.error(e)
+        if done and not errors:
+            st.session_state['pf_ver'] = ver + 1
+            st.rerun()
+        elif not done and not errors:
+            st.info("변경된 내용이 없습니다.")
 
-    t_w, t_o, t_c = st.tabs([f"👀 관심 Pick ({len(watch)})", f"📈 보유 ({len(open_p)})", f"✅ 종료 ({len(closed_p)})"])
-    num_cfg = {c: st.column_config.NumberColumn(c, format="%,d") for c in ('담은가', '진입가', '현재가', '목표가', '손절가')}
-    summary_rows = []
-
-    # ---- 관심 Pick ----
-    with t_w:
-        if not watch:
-            st.caption("🎯 매수 판정 탭이나 🔍 종목 분석에서 '📂 포트폴리오에 담기'를 누르면 여기에 쌓입니다.")
-        else:
-            rows = []
-            for p in watch:
-                price = get_last_price(p['code'], p['market'])
-                m = meta_of(p)
-                chg = round((price / p['entry_price'] - 1) * 100, 1) if price else None
-                rows.append({
-                    'ID': p['id'], '종목': p['name'], '구분': bucket_of(p), '관점': m.get('thesis'),
-                    '테마': theme_of(p), '메모': m.get('note'), '담은 날': str(p['created_at'])[:10],
-                    '당시 판정': m.get('verdict', '-'), '점수': m.get('score'),
-                    '담은가': p['entry_price'], '현재가': int(price) if price else None, '변화(%)': chg,
-                    '목표가': p['target_price'], '손절가': p.get('stop_price'),
-                })
-                summary_rows.append({'테마': theme_of(p), '점수': m.get('score'), '변화(%)': chg})
-            st.dataframe(pd.DataFrame(rows).dropna(axis=1, how='all'), hide_index=True, width=1400,
-                         column_config=num_cfg)
-
-            labels = {f"#{p['id']} {p['name']}": p for p in watch}
-            with st.form("confirm_form", clear_on_submit=True):
-                st.markdown("**✅ 보유로 전환** — 실제로 매수했다면 이유를 적어 보유 목록으로 옮깁니다.")
-                pick = st.selectbox("종목", list(labels.keys()))
-                price_in = st.number_input("실제 매수가(원, 모르면 0 = 담은가)", min_value=0, step=100)
-                reason = st.text_input("왜 사는가? (필수, 10자 이상)",
-                                       placeholder="예: 시장 급락으로 저평가, 실적·배당 안정적")
-                if st.form_submit_button("보유로 전환"):
-                    p = labels[pick]
-                    if len(reason.strip()) < 10:
-                        st.error("매수 이유를 10자 이상 적어야 전환됩니다. 이유가 안 써지면 사지 않는 게 맞을 수 있습니다.")
-                    else:
-                        was_buy = meta_of(p).get('verdict') == VERDICT_BUY
-                        ok_, msg = update_plan(p['id'], {
-                            'status': 'open', 'reason': reason.strip(),
-                            'entry_price': int(price_in) if price_in > 0 else p['entry_price'],
-                            'exception': not was_buy})
-                        if ok_:
-                            st.rerun()
-                        else:
-                            st.error(msg)
-            with st.form("remove_form", clear_on_submit=True):
-                pick_r = st.selectbox("관심 해제할 종목", list(labels.keys()), key="rm_pick")
-                if st.form_submit_button("🗑 관심 해제"):
-                    ok_, msg = delete_plan(labels[pick_r]['id'])
-                    if ok_:
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-    # ---- 보유 ----
-    with t_o:
-        if not open_p:
-            st.caption("보유 중인 종목이 없습니다. 관심 Pick에서 '보유로 전환'하면 여기에 나타납니다.")
-        else:
-            rows = []
-            for p in open_p:
-                price = get_last_price(p['code'], p['market'])
-                m = meta_of(p)
-                chg = round((price / p['entry_price'] - 1) * 100, 1) if price else None
-                rows.append({
-                    'ID': p['id'], '종목': p['name'], '구분': bucket_of(p), '관점': m.get('thesis'),
-                    '테마': theme_of(p), '보유일': _days_since(p['created_at']),
-                    '진입가': p['entry_price'], '현재가': int(price) if price else None,
-                    '목표가': p['target_price'], '손절가': p.get('stop_price'),
-                    '상태': plan_status(p, price), '매수 이유': p['reason'],
-                    '예외': '⚠️' if p.get('exception') else '',
-                })
-                summary_rows.append({'테마': theme_of(p), '점수': m.get('score'), '변화(%)': chg})
-            st.dataframe(pd.DataFrame(rows).dropna(axis=1, how='all'), hide_index=True, width=1400,
-                         column_config=num_cfg)
-
-            labels_o = {f"#{p['id']} {p['name']}": p for p in open_p}
-            with st.form("close_plan_form", clear_on_submit=True):
-                st.markdown("**🏁 보유 종료** — 가격 기록은 선택입니다(본인 매매 기록을 따로 관리한다면 0으로 두세요).")
-                pick = st.selectbox("종목", list(labels_o.keys()))
-                close_price = st.number_input("청산가(원, 모르면 0)", min_value=0, step=100)
-                outcome = st.selectbox("어떻게 끝났나?", OUTCOMES)
-                note = st.text_input("한 줄 복기 (선택)")
-                if st.form_submit_button("종료 기록"):
-                    p = labels_o[pick]
-                    ok_, msg = update_plan(p['id'], {
-                        'status': 'closed', 'closed_at': datetime.now().isoformat(),
-                        'close_price': int(close_price) if close_price > 0 else None,
-                        'outcome': outcome, 'close_note': note.strip()})
-                    if ok_:
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-    # ---- 종료 ----
-    with t_c:
-        if not closed_p:
-            st.caption("아직 종료된 기록이 없습니다.")
-        else:
-            priced = [p for p in closed_p if p.get('close_price') and p.get('entry_price')]
-            followed = sum(1 for p in closed_p if p.get('outcome') != OUTCOMES[2])
-            s1, s2 = st.columns(2)
-            s1.metric("종료 건수", f"{len(closed_p)}건")
-            s2.metric("계획 준수율", f"{followed / len(closed_p) * 100:.0f}%",
-                      help="목표 달성·손절 규칙대로 끝낸 비율 (임의 청산 제외)")
-            if priced:
-                rets = [(p['close_price'] / p['entry_price'] - 1) * 100 for p in priced]
-                st.caption(f"가격이 기록된 {len(priced)}건 평균 수익률 {sum(rets) / len(rets):+.1f}%")
-            st.dataframe(pd.DataFrame([{
-                '종목': p['name'], '테마': theme_of(p), '구분': bucket_of(p), '진입가': p['entry_price'],
-                '청산가': p.get('close_price'),
-                '수익률(%)': round((p['close_price'] / p['entry_price'] - 1) * 100, 1) if p.get('close_price') else None,
-                '결과': p.get('outcome'), '매수 이유': p['reason'], '복기': p.get('close_note', ''),
-                '예외': '⚠️' if p.get('exception') else '',
-            } for p in closed_p]), hide_index=True, width=1400)
-
-    # ---- 컨셉별 요약: 같은 테마끼리 묶어 옥석 가리기 ----
-    if summary_rows:
-        sdf = pd.DataFrame(summary_rows)
+    # 컨셉별 요약 (현재 표시 중인 종목 기준)
+    sdf = pd.DataFrame(rows)
+    sdf = sdf[sdf['상태'] != '종료']
+    if not sdf.empty:
+        sdf['컨셉'] = sdf['컨셉'].replace('', '(미지정)')
         sdf['점수'] = pd.to_numeric(sdf['점수'], errors='coerce')
-        sdf['변화(%)'] = pd.to_numeric(sdf['변화(%)'], errors='coerce')
-        g = sdf.groupby('테마').agg(종목수=('테마', 'size'), 평균점수=('점수', 'mean'),
+        sdf['변화(%)'] = pd.to_numeric(sdf['변화(%)'], errors='coerce') if '변화(%)' in sdf else None
+        g = sdf.groupby('컨셉').agg(종목수=('종목', 'size'), 평균점수=('점수', 'mean'),
                                   평균변화=('변화(%)', 'mean')).round(1).reset_index()
-        st.markdown("**🧭 컨셉(테마)별 요약** — 담은 뒤 변화율과 당시 점수 평균")
-        st.dataframe(g.sort_values('종목수', ascending=False), hide_index=True, width=700,
-                     column_config={"평균변화": st.column_config.NumberColumn("평균변화(%)", format="%.1f")})
+        with st.expander("🧭 컨셉별 요약 (담은 뒤 평균 변화와 당시 점수)"):
+            st.dataframe(g.sort_values('종목수', ascending=False), hide_index=True, width=700,
+                         column_config={"평균변화": st.column_config.NumberColumn("평균변화(%)", format="%.1f")})
+
 
 def fmt_num(v, nd=1, suf=''):
     return f"{v:,.{nd}f}{suf}" if v is not None and pd.notnull(v) else '-'
@@ -1222,12 +1186,11 @@ def render_pick_form(evs, key):
         t = (p.get('plan') or {}).get('theme')
         if t and t not in themes:
             themes.append(t)
-    c1, c2 = st.columns(2)
+    thesis = ''   # 관점은 컨셉과 중복돼 제거 (기존 저장 데이터는 그대로 유지)
+    c1, c2, c3 = st.columns([2, 2, 3])
     bucket = c1.selectbox("포트폴리오 구분", BUCKETS, index=1 if mode == MODE_LONG else 0, key=f"pf_b_{key}")
-    thesis = c2.selectbox("투자 관점", THESES, key=f"pf_t_{key}")
-    c3, c4 = st.columns(2)
-    theme = c3.text_input("섹터·테마 (필수)", key=f"pf_th_{key}", placeholder="예: AI반도체, 2차전지, 방산, 배당주")
-    note = c4.text_input("한 줄 메모 (선택)", key=f"pf_n_{key}")
+    theme = c2.text_input("컨셉·섹터 (필수)", key=f"pf_th_{key}", placeholder="예: AI반도체, 방산, 배당주")
+    note = c3.text_input("한 줄 메모 (선택)", key=f"pf_n_{key}")
     if themes:
         st.caption("자주 쓴 테마: " + ", ".join(themes[:10]))
     if st.button(f"📂 {len(evs)}종목 포트폴리오에 담기", type="primary", key=f"pf_btn_{key}"):
@@ -1246,7 +1209,7 @@ def render_pick_form(evs, key):
             else:
                 failed.append(msg)
         if added:
-            st.success(f"담았습니다: {', '.join(added)} — '📂 내 포트폴리오' 탭에서 확인하세요.")
+            st.success(f"담았습니다: {', '.join(added)} — '📂 내 관심종목' 탭에서 확인하세요.")
         if skipped:
             st.info(f"이미 포트폴리오에 있어 건너뜀: {', '.join(skipped)}")
         if failed:
@@ -1545,7 +1508,7 @@ else:
                                             help="전체 투자금 대비. 분할 횟수로 균등 배분")
 
 
-main_tabs = st.tabs(["🔥 오늘의 핫픽", "🔍 종목 분석", "📂 내 포트폴리오"])
+main_tabs = st.tabs(["🔥 오늘의 핫픽", "🔍 종목 분석", "📂 내 관심종목"])
 
 with main_tabs[0]:
     # ---------- 1) 수집·계산: 버튼 클릭 시에만 실행, 결과는 session_state에 보관 ----------
@@ -1759,7 +1722,10 @@ with main_tabs[0]:
                 """)
 
             # 탭 분리
-            tab0, tab1, tab2 = st.tabs(["🎯 매수 판정", "📊 펀더멘털 분석", "📈 기술적 분석"])
+            # 판정 화면이 기본, 원본 표(펀더멘털·기술)는 종합 리포트와 중복되므로 접어 둠
+            tab0 = st.container()
+            with st.expander("📊 원본 표 보기 (펀더멘털 · 기술적 분석)"):
+                tab1, tab2 = st.tabs(["📊 펀더멘털", "📈 기술적"])
 
             with tab0:
                 if mode == MODE_LONG:
