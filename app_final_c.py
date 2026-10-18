@@ -653,6 +653,186 @@ def evaluate_stock(cur, target, n_reports, per, pbr, opm, num, params):
 
 
 # =========================
+# 매수 계획 저장소 (Supabase 연결 시 영구 저장, 미연결 시 세션 메모리)
+# =========================
+def _sb():
+    """Supabase 접속 정보(Secrets: SUPABASE_URL, SUPABASE_KEY) — 없으면 None"""
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).strip().rstrip('/')
+        key = str(st.secrets.get("SUPABASE_KEY", "")).strip()
+    except Exception:
+        return None
+    return (url, key) if url and key else None
+
+
+def _sb_req(method, path, **kw):
+    url, key = _sb()
+    headers = {'apikey': key, 'Authorization': f'Bearer {key}',
+               'Content-Type': 'application/json', 'Prefer': 'return=representation'}
+    r = requests.request(method, f"{url}/rest/v1/{path}", headers=headers, timeout=10, **kw)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+
+def get_plans(force=False):
+    """저장된 계획 목록(최신순). session_state에 캐시, 쓰기 후 force=True로 갱신"""
+    if force or '_plans' not in st.session_state:
+        if _sb():
+            try:
+                st.session_state['_plans'] = _sb_req('GET', 'plans?select=*&order=created_at.desc&limit=300')
+            except Exception as e:
+                st.error(f"계획 불러오기 실패: {type(e).__name__} - {e}")
+                st.session_state['_plans'] = st.session_state.get('_plans', [])
+        else:
+            st.session_state['_plans'] = st.session_state.get('_plans_mem', [])
+    return st.session_state['_plans']
+
+
+def save_plan(rec):
+    """새 계획 저장 → (성공여부, 메시지)"""
+    try:
+        if _sb():
+            _sb_req('POST', 'plans', json=rec)
+        else:
+            mem = st.session_state.setdefault('_plans_mem', [])
+            mem.insert(0, {**rec, 'id': len(mem) + 1, 'created_at': datetime.now().isoformat()})
+        get_plans(force=True)
+        return True, '저장했습니다.'
+    except Exception as e:
+        return False, f"저장 실패: {type(e).__name__} - {e}"
+
+
+def update_plan(plan_id, fields):
+    try:
+        if _sb():
+            _sb_req('PATCH', f'plans?id=eq.{int(plan_id)}', json=fields)
+        else:
+            for p in st.session_state.get('_plans_mem', []):
+                if p['id'] == plan_id:
+                    p.update(fields)
+        get_plans(force=True)
+        return True, '기록했습니다.'
+    except Exception as e:
+        return False, f"기록 실패: {type(e).__name__} - {e}"
+
+
+def build_plan_record(code, ev, reason, exception):
+    plan = ev.get('plan')
+    plan_json = None
+    if plan:
+        plan_json = {'tranches': [{'price': round(p), 'weight_pct': round(w, 2)} for p, w in plan['tranches']],
+                     'avg': round(plan['avg']), 'review_below': round(plan['review_below'])}
+    return {
+        'code': code, 'name': ev['name'], 'market': ev['market'],
+        'mode': ev.get('mode', MODE_SWING),
+        'entry_price': round(ev['cur']), 'target_price': round(ev['target']),
+        'stop_price': round(ev['stop']) if ev.get('stop') else None,
+        'reason': reason.strip(), 'score': f"{ev['score']}/{ev['total']}",
+        'plan': plan_json, 'exception': bool(exception), 'status': 'open',
+    }
+
+
+@st.cache_data(ttl=600)
+def get_last_price(code, market):
+    if not YF_AVAILABLE:
+        return None
+    try:
+        df = yf.download(f"{code}{'.KS' if market == 'KOSPI' else '.KQ'}", period='5d',
+                         interval='1d', progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return float(df['Close'].dropna().iloc[-1]) if not df.empty else None
+    except Exception:
+        return None
+
+
+def plan_status(p, price):
+    """저장된 약속 대비 현재 상태 문구"""
+    if price is None:
+        return '현재가 확인 불가'
+    ret = (price / p['entry_price'] - 1) * 100
+    tgt, stop = p.get('target_price'), p.get('stop_price')
+    review = (p.get('plan') or {}).get('review_below')
+    if tgt and price >= tgt:
+        return f"🎯 목표 도달 — 계획대로 매도 ({ret:+.1f}%)"
+    if stop and price <= stop:
+        return f"🛑 손절선 이탈 — 계획대로 정리 ({ret:+.1f}%)"
+    if review and price <= review:
+        return f"⚠️ 재검토 조건 도달 — 추가매수 중단·가설 점검 ({ret:+.1f}%)"
+    return f"보유 중 ({ret:+.1f}%)"
+
+
+OUTCOMES = ['목표 달성 후 매도', '손절·재검토 후 정리', '계획 없이 임의 청산']
+
+
+def render_plans():
+    """내 매수 계획·일지 섹션 (진행 중 계획 + 종료 기록 + 규율 통계)"""
+    st.markdown("---")
+    st.subheader("📒 내 매수 계획 · 일지")
+    if not _sb():
+        st.warning("⚠️ 저장소 미연결 — 지금은 이 브라우저 세션에만 저장돼 새로고침하면 사라집니다. "
+                   "영구 저장은 README의 'Supabase 연결' 3단계를 따라 Secrets에 키를 넣으세요.")
+    plans = get_plans()
+    open_p = [p for p in plans if p.get('status') == 'open']
+    closed_p = [p for p in plans if p.get('status') == 'closed']
+
+    if not open_p:
+        st.caption("진행 중인 계획이 없습니다. 🎯 매수 판정 탭에서 종목을 선택해 계획을 저장하세요.")
+    else:
+        rows = []
+        for p in open_p:
+            price = get_last_price(p['code'], p['market'])
+            held = (datetime.now().date() - datetime.strptime(str(p['created_at'])[:10], '%Y-%m-%d').date()).days
+            rows.append({
+                'ID': p['id'], '종목': p['name'], '모드': p['mode'], '보유일': held,
+                '진입가': p['entry_price'], '현재가': int(price) if price else None,
+                '목표가': p['target_price'], '손절가': p.get('stop_price'),
+                '상태': plan_status(p, price), '매수 이유': p['reason'],
+                '예외': '⚠️' if p.get('exception') else '',
+            })
+        st.dataframe(pd.DataFrame(rows).dropna(axis=1, how='all'), hide_index=True, width=1400,
+                     column_config={c: st.column_config.NumberColumn(c, format="%,d")
+                                    for c in ('진입가', '현재가', '목표가', '손절가')})
+
+        with st.form("close_plan_form", clear_on_submit=True):
+            st.markdown("**✅ 청산 기록**")
+            labels = {f"#{p['id']} {p['name']}": p for p in open_p}
+            pick = st.selectbox("종목", list(labels.keys()))
+            close_price = st.number_input("청산가(원)", min_value=0, step=100)
+            outcome = st.selectbox("어떻게 끝났나?", OUTCOMES)
+            note = st.text_input("한 줄 복기 (선택)")
+            if st.form_submit_button("기록"):
+                p = labels[pick]
+                if close_price <= 0:
+                    st.error("청산가를 입력하세요.")
+                else:
+                    ok_, msg = update_plan(p['id'], {
+                        'status': 'closed', 'closed_at': datetime.now().isoformat(),
+                        'close_price': int(close_price), 'outcome': outcome, 'close_note': note.strip()})
+                    (st.success if ok_ else st.error)(msg)
+                    if ok_:
+                        st.rerun()
+
+    if closed_p:
+        rets = [(p['close_price'] / p['entry_price'] - 1) * 100 for p in closed_p]
+        followed = sum(1 for p in closed_p if p.get('outcome') != OUTCOMES[2])
+        exc_rets = [r for r, p in zip(rets, closed_p) if p.get('exception')]
+        s1, s2, s3 = st.columns(3)
+        s1.metric("종료 건수", f"{len(closed_p)}건")
+        s2.metric("계획 준수율", f"{followed / len(closed_p) * 100:.0f}%",
+                  help="목표 달성·손절 규칙대로 끝낸 비율 (임의 청산 제외)")
+        s3.metric("평균 수익률", f"{sum(rets) / len(rets):+.1f}%",
+                  f"예외 매수 평균 {sum(exc_rets) / len(exc_rets):+.1f}%" if exc_rets else None, delta_color="off")
+        with st.expander("📜 종료된 기록 보기"):
+            st.dataframe(pd.DataFrame([{
+                '종목': p['name'], '진입가': p['entry_price'], '청산가': p['close_price'],
+                '수익률(%)': round((p['close_price'] / p['entry_price'] - 1) * 100, 1),
+                '결과': p.get('outcome'), '매수 이유': p['reason'], '복기': p.get('close_note', ''),
+                '예외': '⚠️' if p.get('exception') else '',
+            } for p in closed_p]), hide_index=True, width=1400)
+
+
+# =========================
 # UI
 # =========================
 st.title("🎯 AI 투자 전략 엔진")
@@ -1006,6 +1186,20 @@ if res:
                         p4.metric("손익비", f"{ev['rr']:.1f}" if ev['rr'] is not None else "-")
                         if ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
                             st.warning(f"💛 **{int(ev['wait_price']):,}원 이하**로 내려오면 손익비·손절폭 규칙을 충족합니다. 그 전엔 사지 않습니다.")
+                    is_exc = ev['verdict'] != VERDICT_BUY
+                    st.markdown("**📝 매수 계획 저장**")
+                    with st.form(f"plan_form_{sel0['종목코드']}_{mode}", clear_on_submit=True):
+                        if is_exc:
+                            st.caption("⚠️ 규칙을 통과하지 못한 종목입니다. 그래도 매수한다면 '예외 매수'로 기록되고, 예외 성과는 따로 집계됩니다.")
+                        reason = st.text_input("왜 사는가? (필수, 10자 이상)",
+                                               placeholder="예: 시장 급락으로 저평가, 실적·배당 안정적")
+                        submitted = st.form_submit_button("⚠️ 예외 매수로 저장" if is_exc else "💾 이 계획으로 저장")
+                    if submitted:
+                        if len(reason.strip()) < 10:
+                            st.error("매수 이유를 10자 이상 적어야 저장됩니다. 이유가 안 써지면 사지 않는 게 맞을 수 있습니다.")
+                        else:
+                            ok_, msg = save_plan(build_plan_record(sel0['종목코드'], ev, reason, is_exc))
+                            (st.success if ok_ else st.error)(msg + (" 아래 '📒 내 매수 계획'에서 확인하세요." if ok_ else ""))
                     st.markdown("**확신 체크리스트**")
                     for label, passed, detail in ev['checks']:
                         mark = '✅' if passed else ('➖' if passed is None else '❌')
@@ -1131,6 +1325,8 @@ if res:
             f"슬라이더를 낮춰 보세요. (시세 매칭 성공: {matched_n}건)"
         )
 
+
+render_plans()
 
 st.markdown("---")
 col_a, col_b = st.columns([2, 1])
