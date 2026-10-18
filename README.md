@@ -33,6 +33,16 @@ create table plans (
 alter table plans enable row level security;  -- 정책 없음 = 외부 직접 접근 차단
 ```
 
+   **(선택) 목표가 추이 추적** — 날마다 목표가를 저장해 '3회 연속 하향'을 감지하려면 아래도 실행:
+```sql
+create table consensus_snap (
+  code text, snap_date date, target numeric, n_reports int, recomm numeric,
+  primary key (code, snap_date)
+);
+alter table consensus_snap enable row level security;
+```
+   (이 테이블이 없어도 앱은 정상 동작하고, 해당 기능만 꺼집니다.)
+
 2. **Project Settings → API**에서 `Project URL`과 `service_role` 키 복사
 3. Streamlit Cloud → 앱 → **Settings → Secrets**에 추가
 ```toml

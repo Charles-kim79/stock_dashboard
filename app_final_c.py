@@ -7,6 +7,8 @@ import re
 import time
 import hmac
 
+APP_VERSION = "v1.4"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
+
 try:
     import yfinance as yf
     YF_AVAILABLE = True
@@ -64,7 +66,7 @@ if "login_fail" not in st.session_state:
 
 if not st.session_state.auth:
     st.markdown("## 🔒 AI 투자 전략 엔진")
-    st.caption("Designed by Charles Kim · v1.1")
+    st.caption(f"Designed by Charles Kim · {APP_VERSION}")
     if st.session_state.login_fail >= MAX_LOGIN_TRIES:
         st.error("시도 횟수를 초과했습니다. 페이지를 새로고침한 뒤 다시 시도하세요.")
         st.stop()
@@ -234,6 +236,7 @@ def get_stock_details(code):
         'ROE': None, '부채비율': None, '영업이익_직전': None, '영업이익_추정': None,
         '추정PER': None, '추정EPS': None, 'EPS': None, '의견평균': None, 'peers': [],
         '목표주가': None, '리포트수': 0, '리포트목록': [],
+        '외인5일': None, '기관5일': None, '수급일수': 0, 'IR일정': None,
     }
 
     # 1) 연간 재무: 직전 확정연도 + 컨센서스(추정) 연도
@@ -295,6 +298,22 @@ def get_stock_details(code):
             details['리포트수'] = len(rs)
             details['리포트목록'] = [{'제목': r.get('tit'), '증권사': r.get('bnm'), '일자': r.get('wdt')}
                                   for r in rs[:5]]
+            # 수급: 최근 5거래일 외국인·기관 순매수 수량 합 (최신순 목록)
+            deals = (data.get('dealTrendInfos') or [])[:5]
+            if deals:
+                fo = [_f(x.get('foreignerPureBuyQuant')) for x in deals]
+                og = [_f(x.get('organPureBuyQuant')) for x in deals]
+                if any(v is not None for v in fo) and any(v is not None for v in og):
+                    details['외인5일'] = sum(v for v in fo if v is not None)
+                    details['기관5일'] = sum(v for v in og if v is not None)
+                    details['수급일수'] = len(deals)
+            # 다음 IR/실적 발표 일정
+            ir = data.get('irScheduleInfo')
+            if isinstance(ir, list):
+                ir = ir[0] if ir else None
+            if isinstance(ir, dict) and ir.get('irScheduleDate'):
+                details['IR일정'] = {'title': ir.get('title'), 'date': ir.get('irScheduleDate'),
+                                   'dday': _f(ir.get('irScheduleDday'))}
             peers = data.get('industryCompareInfo') or []
             if isinstance(peers, list):
                 details['peers'] = [p.get('itemCode') for p in peers
@@ -712,37 +731,56 @@ def score_stock(cur, target, n_reports, d, num, mkt_dd, mode):
     else:
         dbl, dtxt = 0.0, '데이터 없음'
 
+    # 수급: 최근 5거래일 외국인·기관 순매수 합 (둘 다 사면 만점, 둘 다 팔면 0점)
+    fo, og = d.get('외인5일'), d.get('기관5일')
+    if fo is None or og is None:
+        sup, stxt = 0.5, '수급 데이터 없음 (중립)'
+    else:
+        if fo > 0 and og > 0:
+            sup = 1.0
+        elif fo + og > 0:
+            sup = 0.67
+        elif fo > 0 or og > 0:
+            sup = 0.33
+        else:
+            sup = 0.0
+        stxt = f"최근 {d.get('수급일수', 5)}일 외국인 {fo / 10000:+,.1f}만주 · 기관 {og / 10000:+,.1f}만주"
+
     if mode == MODE_LONG:
         if s_depth is None:
-            items.append(_item('타이밍', '고점 대비 눌림', 0, 7, '데이터 없음'))
+            items.append(_item('타이밍', '고점 대비 눌림', 0, 6, '데이터 없음'))
         else:
-            pts = 7 if s_depth >= 25 else 5 if s_depth >= 15 else 2 if s_depth >= 10 else 0
-            items.append(_item('타이밍', '6개월 고점 대비 눌림', pts, 7, f"-{s_depth:.0f}%"))
+            pts = 6 if s_depth >= 25 else 4 if s_depth >= 15 else 2 if s_depth >= 10 else 0
+            items.append(_item('타이밍', '6개월 고점 대비 눌림', pts, 6, f"-{s_depth:.0f}%"))
         if cause == 'market':
-            items.append(_item('타이밍', '하락 원인', 7, 7, f"종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 시장 요인 중심"))
+            items.append(_item('타이밍', '하락 원인', 5, 5, f"종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 시장 요인 중심"))
         elif cause == 'stock':
-            items.append(_item('타이밍', '하락 원인', 0, 7, f"종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 개별 악재 가능성"))
+            items.append(_item('타이밍', '하락 원인', 0, 5, f"종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 개별 악재 가능성"))
         else:
-            items.append(_item('타이밍', '하락 원인', 3, 7, '조정 미미 또는 지수 데이터 없음 (중립 3점)'))
-        items.append(_item('타이밍', 'RSI+스토캐스틱 이중 확인', round(6 * dbl), 6, dtxt))
+            items.append(_item('타이밍', '하락 원인', 2, 5, '조정 미미 또는 지수 데이터 없음 (중립 2점)'))
+        items.append(_item('타이밍', 'RSI+스토캐스틱 이중 확인', round(4 * dbl), 4, dtxt))
+        items.append(_item('타이밍', '수급(외국인·기관)', round(5 * sup), 5, stxt))
     else:
-        tpts = 6 if trend_up else 3 if (num and not trend_down) else 0
-        items.append(_item('타이밍', '추세(20일선)', tpts, 6,
+        tpts = 5 if trend_up else 2 if (num and not trend_down) else 0
+        items.append(_item('타이밍', '추세(20일선)', tpts, 5,
                            '상승' if trend_up else '하락' if trend_down else '횡보' if num else '데이터 없음'))
         if bb_pct is None:
-            items.append(_item('타이밍', '볼린저 위치', 0, 6, '데이터 없음'))
+            items.append(_item('타이밍', '볼린저 위치', 0, 4, '데이터 없음'))
         else:
-            pts = 6 if bb_pct < 0.3 else 4 if bb_pct < 0.5 else 2 if bb_pct < 0.7 else 0
-            items.append(_item('타이밍', '볼린저 위치', pts, 6, f"밴드 내 {bb_pct * 100:.0f}% 지점 (낮을수록 유리)"))
-        items.append(_item('타이밍', 'RSI+스토캐스틱 이중 확인', round(8 * dbl), 8, dtxt))
+            pts = 4 if bb_pct < 0.3 else 3 if bb_pct < 0.5 else 1 if bb_pct < 0.7 else 0
+            items.append(_item('타이밍', '볼린저 위치', pts, 4, f"밴드 내 {bb_pct * 100:.0f}% 지점 (낮을수록 유리)"))
+        items.append(_item('타이밍', 'RSI+스토캐스틱 이중 확인', round(5 * dbl), 5, dtxt))
+        items.append(_item('타이밍', '수급(외국인·기관)', round(6 * sup), 6, stxt))
 
+    ir = d.get('IR일정') or {}
+    earn_dday = ir.get('dday') if '실적' in str(ir.get('title', '')) else None
     ctx = {'gap': gap, 'trend_down': trend_down, 'rsi': rsi, 'bb_pct': bb_pct, 'cause': cause,
-           's_depth': s_depth, 'high': high, 'op_fwd': op_fwd}
+           's_depth': s_depth, 'high': high, 'op_fwd': op_fwd, 'earn_dday': earn_dday}
     return items, ctx
 
 
-def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params):
-    """점수 + 가격 계획 + 판정(매수 적정/대기/제외)"""
+def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params, trend=None):
+    """점수 + 가격 계획 + 판정(매수 적정/대기/제외). trend: 목표가 추이(target_trend 결과)"""
     items, ctx = score_stock(cur, target, n_reports, d, num, mkt_dd, mode)
     cats = {c: (sum(i['pts'] for i in items if i['cat'] == c), mx) for c, mx in CATS}
     score = sum(p for p, _ in cats.values())
@@ -779,6 +817,17 @@ def evaluate(mode, cur, target, n_reports, d, num, mkt_dd, params):
         return out
     if score < params['min_score']:
         out['verdict'], out['reason'] = VERDICT_SKIP, f"종합 {score}점 (기준 {params['min_score']}점 미만)"
+        return out
+
+    # 이벤트 게이트: 점수가 좋아도 지금 사지 않는 이유 (실적 발표 직전, 목표가 연속 하향)
+    event_reasons = []
+    ew = params.get('earn_wait', 0)
+    if ew and ctx['earn_dday'] is not None and 0 <= ctx['earn_dday'] <= ew:
+        event_reasons.append(f"실적 발표 D-{int(ctx['earn_dday'])} — 발표 후 재검토")
+    if trend and trend.get('dir') == 'down':
+        event_reasons.append(f"목표가 연속 하향({trend['text']}) — 가설 재점검")
+    if event_reasons:
+        out['verdict'], out['reason'] = VERDICT_WAIT, ' · '.join(event_reasons)
         return out
 
     if mode == MODE_LONG:
@@ -831,13 +880,63 @@ def _sb():
     return (url, key) if url and key else None
 
 
-def _sb_req(method, path, **kw):
+def _sb_req(method, path, prefer='return=representation', **kw):
     url, key = _sb()
     headers = {'apikey': key, 'Authorization': f'Bearer {key}',
-               'Content-Type': 'application/json', 'Prefer': 'return=representation'}
+               'Content-Type': 'application/json', 'Prefer': prefer}
     r = requests.request(method, f"{url}/rest/v1/{path}", headers=headers, timeout=10, **kw)
     r.raise_for_status()
     return r.json() if r.text else []
+
+
+# ---- 목표가 스냅샷: 날마다 컨센서스 목표가를 저장해 '연속 하향'을 감지 (consensus_snap 테이블, 선택 기능) ----
+def snapshot_targets(items):
+    """items: [{'code','target','n_reports','recomm'}] → 오늘자로 upsert. 실패해도 앱은 계속 동작"""
+    rows = [{'code': i['code'], 'snap_date': datetime.now().strftime('%Y-%m-%d'), 'target': i['target'],
+             'n_reports': i.get('n_reports'), 'recomm': i.get('recomm')}
+            for i in items if i.get('target')]
+    if not rows or not _sb():
+        return False
+    try:
+        _sb_req('POST', 'consensus_snap?on_conflict=code,snap_date',
+                prefer='resolution=merge-duplicates,return=minimal', json=rows)
+        return True
+    except Exception:
+        st.session_state['snap_error'] = True
+        return False
+
+
+def get_target_hist(codes):
+    """{종목코드: [(날짜, 목표가), ...] 오래된 순} — 최근 90일. 테이블 없거나 미연결이면 {}"""
+    if not codes or not _sb():
+        return {}
+    try:
+        since = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+        lst = ','.join(sorted(set(codes)))
+        rows = _sb_req('GET', f"consensus_snap?select=code,snap_date,target&code=in.({lst})"
+                              f"&snap_date=gte.{since}&order=snap_date.asc&limit=2000")
+    except Exception:
+        st.session_state['snap_error'] = True
+        return {}
+    out = {}
+    for r in rows:
+        if r.get('target') is not None:
+            out.setdefault(r['code'], []).append((str(r['snap_date'])[:10], float(r['target'])))
+    return out
+
+
+def target_trend(hist):
+    """목표가 추이 판정: 최근 3개 스냅샷이 계속 낮아지면 'down'(연속 하향), 계속 오르면 'up'"""
+    if not hist or len(hist) < 3:
+        return {'dir': 'insufficient', 'text': '이력 부족(날마다 추출하면 쌓입니다)', 'points': hist or []}
+    a, b, c = hist[-3][1], hist[-2][1], hist[-1][1]
+    chg = (c / hist[0][1] - 1) * 100 if hist[0][1] else 0
+    text = f"{hist[-3][1]:,.0f}→{hist[-2][1]:,.0f}→{c:,.0f}원"
+    if a > b > c:
+        return {'dir': 'down', 'text': text, 'points': hist, 'chg': chg}
+    if a < b < c:
+        return {'dir': 'up', 'text': text, 'points': hist, 'chg': chg}
+    return {'dir': 'flat', 'text': text, 'points': hist, 'chg': chg}
 
 
 def get_plans(force=False):
@@ -1211,6 +1310,36 @@ def render_stock_report(code, ev, d, tech):
                     f"볼린저 {fmt_num(num['bb_pct'] * 100, 0, '%') if num.get('bb_pct') is not None else '-'} · 6M 고점 대비 -{fmt_num(dd, 0, '%')}  \n"
                     f"{tech.get('종합 시그널', '-')}")
 
+    # 수급 · 일정 · 목표가 추이
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.markdown("**🧾 수급 (최근 5거래일)**")
+        fo, og = d.get('외인5일'), d.get('기관5일')
+        if fo is None or og is None:
+            st.markdown("데이터 없음")
+        else:
+            st.markdown(f"외국인 {fo / 10000:+,.1f}만주  \n기관 {og / 10000:+,.1f}만주")
+    with e2:
+        st.markdown("**📅 다음 일정**")
+        ir = d.get('IR일정')
+        if ir:
+            dd_txt = f" (D-{int(ir['dday'])})" if ir.get('dday') is not None else ''
+            st.markdown(f"{ir.get('title', '')}  \n{ir.get('date', '')}{dd_txt}")
+        else:
+            st.markdown("예정된 IR 일정 없음")
+    with e3:
+        st.markdown("**🎯 목표가 추이**")
+        tr = ev.get('trend')
+        if tr and tr['dir'] in ('down', 'up', 'flat'):
+            icon = {'down': '🔻 연속 하향', 'up': '🔺 연속 상향', 'flat': '➖ 혼조'}[tr['dir']]
+            st.markdown(f"{icon}  \n{tr['text']}")
+        elif not _sb():
+            st.markdown("저장소 미연결 — 추적 불가")
+        elif st.session_state.get('snap_error'):
+            st.markdown("추적용 테이블이 없습니다 (README 참고)")
+        else:
+            st.markdown("이력 쌓는 중 (날마다 추출하면 3회 후 판정)")
+
     # 가격 계획
     if ev.get('plan'):
         plan = ev['plan']
@@ -1297,9 +1426,12 @@ def analyze_code(code, name=None, market=None):
     tech_all, _ = get_technical_signals_batch([{'종목코드': code, '시장': market}])
     tech = tech_all.get(code, {})
     target = d.get('목표주가')
+    snapshot_targets([{'code': code, 'target': target, 'n_reports': d.get('리포트수'), 'recomm': d.get('의견평균')}])
+    trend = target_trend(get_target_hist([code]).get(code))
     idx_dd = get_index_drawdowns() if mode == MODE_LONG else {}
     ev = evaluate(mode, basic['cur'], target if target else basic['cur'], int(d.get('리포트수') or 0),
-                  d, tech.get('_num'), idx_dd.get(market), RULES)
+                  d, tech.get('_num'), idx_dd.get(market), RULES, trend=trend)
+    ev['trend'] = trend
     ev['name'] = name or basic.get('name') or code
     ev['market'] = market
     ev['no_target'] = not target
@@ -1358,7 +1490,7 @@ with h2:
         st.session_state.pop('search_res', None)
         st.session_state['reset_n'] = rn + 1
         st.rerun()
-st.markdown("##### `v1.3` · Investment Strategy Dashboard")
+st.markdown(f"##### `{APP_VERSION}` · Investment Strategy Dashboard")
 
 st.info("""
 **📌 목적** — 한경 컨센서스 신규 리포트 중 저평가 종목을 찾아 **점수(100점)로 근거를 보여주고**, 선정한 종목을 포트폴리오에 저장
@@ -1381,6 +1513,11 @@ threshold = st.sidebar.slider(
     help="목표가 대비 현재가가 이 수치 이상 저평가된 종목만 표시"
 )
 
+excl_spac_pref = st.sidebar.checkbox("스팩·우선주 제외", value=True,
+                                      help="데이터가 부실하거나 분석 의미가 낮은 종목을 후보에서 뺍니다")
+min_mcap = st.sidebar.slider("최소 시가총액 (억원)", 0, 5000, 1000, 100,
+                             help="너무 작은 종목은 데이터·유동성이 불안정해 후보에서 제외 (0=제한 없음)")
+
 show_debug = st.sidebar.checkbox("진단 모드", value=False,
                             help="데이터 수집 단계의 상세 정보 표시")
 
@@ -1391,8 +1528,10 @@ mode = st.sidebar.radio(
     help="단기·스윙: 추세 하락이면 대기 / 중장기: 시장 요인 하락 + 체력 양호 시 분할매수")
 min_score = st.sidebar.slider("최소 종합 점수 (100점)", 30, 90, 60,
                               help="이 점수 미만이면 '제외'. 오늘 후보 점수 분포를 보고 조정하세요.")
+earn_wait = st.sidebar.slider("실적 발표 N일 전엔 대기", 0, 10, 5,
+                             help="실적 발표가 N일 이내면 점수가 높아도 '대기'로 판정 (0=사용 안 함)")
 RULES = {'min_score': min_score, 'min_rr': 2.0, 'max_loss': 10,
-         'n_split': 3, 'split_step': 7, 'max_weight': 5}
+         'n_split': 3, 'split_step': 7, 'max_weight': 5, 'earn_wait': earn_wait}
 if mode == MODE_SWING:
     RULES['min_rr'] = st.sidebar.slider("최소 손익비", 1.0, 4.0, 2.0, 0.5,
                                         help="(목표가-현재가)/(현재가-손절가). 미달이면 '대기'")
@@ -1460,6 +1599,15 @@ with main_tabs[0]:
             matched['종목평균괴리율'] = matched.groupby('종목코드')['괴리율(%)'].transform('mean')
 
             hot_picks = matched[matched['괴리율(%)'] >= threshold].copy()
+            n_before = hot_picks['종목코드'].nunique()
+            if excl_spac_pref and not hot_picks.empty:
+                is_spac = hot_picks['종목명_x'].astype(str).str.contains('스팩')
+                is_pref = ~hot_picks['종목코드'].astype(str).str.endswith('0')      # 우선주는 코드 끝자리가 0이 아님
+                hot_picks = hot_picks[~(is_spac | is_pref)].copy()
+            if min_mcap > 0 and not hot_picks.empty and '시가총액' in hot_picks.columns:
+                mcap = hot_picks['시가총액'].map(parse_mcap_eok)
+                hot_picks = hot_picks[mcap.isna() | (mcap >= min_mcap)].copy()
+            n_filtered = n_before - hot_picks['종목코드'].nunique()
             hot_picks = hot_picks.sort_values(
                 by=['종목평균괴리율', '종목코드', '괴리율(%)'],
                 ascending=[False, True, False]
@@ -1469,7 +1617,7 @@ with main_tabs[0]:
             consensus = (matched.groupby('종목코드')['적정가격']
                          .agg(['mean', 'count']).to_dict('index'))
 
-            tech_signals, diag_sample, details_map = {}, None, {}
+            tech_signals, diag_sample, details_map, hist_map = {}, None, {}, {}
             if not hot_picks.empty:
                 unique_items = hot_picks[['종목코드', '시장']].drop_duplicates().to_dict('records')
 
@@ -1483,6 +1631,11 @@ with main_tabs[0]:
                     d = dict(get_stock_details(c))
                     d['업종PER'] = get_peer_fper(tuple(d.get('peers') or ()))
                     details_map[c] = d
+
+                # 목표가 스냅샷 저장(Supabase 연결 시) → 연속 하향 감지에 사용
+                snapshot_targets([{'code': c, 'target': dd.get('목표주가'), 'n_reports': dd.get('리포트수'),
+                                   'recomm': dd.get('의견평균')} for c, dd in details_map.items()])
+                hist_map = get_target_hist(list(details_map.keys()))
 
                 # 정렬이 정확하도록 숫자는 숫자 열로, 이모지는 별도 '신호' 열로 분리
                 num_cols = {k: [] for k in ('PER', '추정PER', 'PBR', '영익률(%)', 'ROE(%)', 'RSI', '볼린저(%)')}
@@ -1531,7 +1684,8 @@ with main_tabs[0]:
             st.session_state['result'] = {
                 'hot_picks': hot_picks, 'consensus': consensus,
                 'details_map': details_map, 'tech_signals': tech_signals,
-                'diag_sample': diag_sample, 'n_reports': len(research_df),
+                'diag_sample': diag_sample, 'n_reports': len(research_df), 'hist_map': hist_map,
+                'n_filtered': n_filtered,
                 'n_matched': len(matched), 'threshold': threshold,
                 'period': period_option, 'at': datetime.now().strftime('%Y-%m-%d %H:%M'),
             }
@@ -1542,7 +1696,10 @@ with main_tabs[0]:
         hot_picks = res['hot_picks']
         consensus, details_map, tech_signals = res['consensus'], res['details_map'], res['tech_signals']
         diag_sample, matched_n = res['diag_sample'], res['n_matched']
+        hist_map = res.get('hist_map', {})
 
+        if res.get('n_filtered'):
+            st.caption(f"🧹 스팩·우선주·소형주 필터로 {res['n_filtered']}종목을 후보에서 제외했습니다 (사이드바에서 조정)")
         st.caption(f"🕒 추출 시각 {res['at']} · 리포트 기간 {res['period']} · 괴리율 하한 {res['threshold']}% "
                    f"(판정 규칙은 사이드바에서 바꾸면 즉시 반영, 추출 조건은 다시 추출해야 반영)")
         c1, c2, c3, c4 = st.columns(4)
@@ -1568,8 +1725,9 @@ with main_tabs[0]:
                     continue
                 ev = evaluate(mode, float(r0['현재가']), float(cons['mean']), int(cons['count']),
                               details_map.get(code, {}), tech_signals.get(code, {}).get('_num'),
-                              idx_dd.get(r0['시장']), RULES)
+                              idx_dd.get(r0['시장']), RULES, trend=target_trend(hist_map.get(code)))
                 ev['name'] = r0['종목명_x']; ev['market'] = r0['시장']
+                ev['trend'] = target_trend(hist_map.get(code))
                 verdicts[code] = ev
 
             st.success(f"✅ 오늘의 핫픽 {len(hot_picks)}건 ({len(verdicts)}종목) 추출 완료")
@@ -1582,10 +1740,13 @@ with main_tabs[0]:
                 | **밸류에이션** | 25 | 추정PER(포워드)을 동일업종 중앙값과 비교, PBR | 가격이 싼가 — 미래 이익 기준 |
                 | **성장·전망** | 35 | 영업이익·EPS 추정 성장, 목표가 괴리율, 애널리스트 의견 | 주가는 미래 이익을 따라감 → 가장 큰 비중 |
                 | **수익성·체력** | 20 | 영익률 또는 ROE(대기업 고려해 8%/10%를 양호로), 부채비율 | 망하지 않을 회사인가 |
-                | **타이밍** | 20 | 스윙: 추세·볼린저·RSI+스토캐스틱 이중확인 / 중장기: 눌림·하락원인·이중확인 | 과거 지표라 비중을 낮춤 |
+                | **타이밍** | 20 | 스윙: 추세·볼린저·RSI+스토캐스틱 이중확인·**수급** / 중장기: 눌림·하락원인·이중확인·**수급** | 과거 지표라 비중을 낮춤 |
 
                 - **이중 확인**: RSI와 스토캐스틱이 *동시에* 과매도일 때만 만점 (하나만 낮으면 부분점수)
+                - **수급**: 최근 5거래일 외국인·기관 순매수 — 둘 다 사면 만점, 둘 다 팔면 0점
                 - **하드 게이트**: 영업이익 적자 전망은 점수와 무관하게 ⚪ 제외 / 중장기 모드는 '개별 악재' 의심 시 제외
+                - **이벤트 게이트(→ 💛 대기)**: 실적 발표 N일 이내 · 목표가 3회 연속 하향(날마다 저장되는 스냅샷 기준, Supabase 테이블 필요)
+                - **후보 필터**: 스팩·우선주·소형주(기본 시총 1,000억 미만)는 후보에서 제외 (사이드바)
                 - **점수 vs 손익비**: 점수는 *좋은 종목인가*, 손익비는 *지금 가격이 좋은가*.
                   손익비 = (목표가−현재가)÷(현재가−손절가). 스윙 모드에서 점수가 높아도 손익비가 낮으면 💛 대기
                 - 판정: **💚 매수 적정** = 점수 통과 + 가격 조건 통과 · **💛 대기** = 점수는 통과, 가격·추세 불리 · **⚪ 제외** = 점수 미달/게이트
@@ -1850,4 +2011,4 @@ col_a, col_b = st.columns([2, 1])
 with col_a:
     st.caption("📊 데이터 출처: 한경 컨센서스 + 네이버 금융 · 모든 투자 책임은 본인에게 있습니다.")
 with col_b:
-    st.caption("**Designed by Charles Kim** · v1.3 · 2026")
+    st.caption(f"**Designed by Charles Kim** · {APP_VERSION} · 2026")
