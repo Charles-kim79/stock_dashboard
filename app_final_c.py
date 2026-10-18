@@ -461,6 +461,7 @@ def get_technical_signals_batch(unique_items):
                 '_num': {
                     'close': float(close), 'ma20': float(ma20), 'bb_lower': float(lower),
                     'low20': float(low20), 'slope': float(slope),
+                    'high6m': float(df['Close'].max()),
                     'rsi': float(rsi_val) if pd.notnull(rsi_val) else None,
                     'bb_pct': float(bb_pct) if bb_pct is not None else None,
                 },
@@ -483,6 +484,100 @@ def get_technical_signals_batch(unique_items):
 VERDICT_BUY = '💚 매수 적정'
 VERDICT_WAIT = '💛 대기'
 VERDICT_SKIP = '⚪ 제외'
+MODE_SWING = '단기·스윙'
+MODE_LONG = '중장기 분할매수'
+
+
+@st.cache_data(ttl=3600)
+def get_index_drawdowns():
+    """코스피/코스닥 지수의 최근 6개월 고점 대비 낙폭(%, 음수). 실패 시 빈 dict."""
+    out = {}
+    if not YF_AVAILABLE:
+        return out
+    for mkt, tk in (('KOSPI', '^KS11'), ('KOSDAQ', '^KQ11')):
+        try:
+            df = yf.download(tk, period='6mo', interval='1d', progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df.empty:
+                continue
+            out[mkt] = float((df['Close'].iloc[-1] / df['Close'].max() - 1) * 100)
+        except Exception:
+            continue
+    return out
+
+
+def evaluate_stock_long(cur, target, n_reports, per, pbr, opm, num, mkt_dd, params):
+    """중장기 분할매수 판정: 하락 원인(시장 vs 개별) + 체력 확인 + 분할 계획
+
+    mkt_dd: 해당 시장 지수의 6개월 고점 대비 낙폭(%, 음수) 또는 None
+    """
+    gap = (target - cur) / cur * 100 if cur else None
+    high = num.get('high6m') if num else None
+    stock_dd = (cur / high - 1) * 100 if high else None          # 음수
+    s_depth = -stock_dd if stock_dd is not None else None        # 양수 낙폭
+    m_depth = -mkt_dd if mkt_dd is not None else None
+
+    dipped = s_depth is not None and s_depth >= 15
+    if s_depth is None:
+        cause, cause_txt = None, '데이터 없음'
+    elif s_depth < 10:
+        cause, cause_txt = 'none', f'낙폭 {s_depth:.0f}% (조정 미미)'
+    elif m_depth is None:
+        cause, cause_txt = None, f'종목 낙폭 {s_depth:.0f}% (지수 데이터 없음)'
+    elif s_depth <= max(m_depth * 1.5, m_depth + 5):
+        cause, cause_txt = 'market', f'종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 시장 요인 중심'
+    else:
+        cause, cause_txt = 'stock', f'종목 -{s_depth:.0f}% vs 지수 -{m_depth:.0f}% → 개별 악재 가능성'
+
+    def has(v):
+        return v is not None
+
+    checks = [
+        ('고점 대비 -15% 이상 눌림', dipped if has(s_depth) else None,
+         f"-{s_depth:.0f}%" if has(s_depth) else '데이터 없음'),
+        ('하락이 시장 요인 중심(개별 악재 아님)', cause in ('market', 'none') if cause else None, cause_txt),
+        ('괴리율 30% 이상', gap is not None and gap >= 30, f"{gap:.1f}%" if gap is not None else '-'),
+        ('리포트 2건 이상(복수 확인)', n_reports >= 2, f"{n_reports}건"),
+        ('흑자(PER>0)', (per > 0) if has(per) else None, f"{per}" if has(per) else '데이터 없음'),
+        ('PBR 1.5배 이하', (pbr <= 1.5) if has(pbr) else None, f"{pbr}" if has(pbr) else '데이터 없음'),
+        ('영업이익률 5% 이상', (opm >= 5) if has(opm) else None, f"{opm}%" if has(opm) else '데이터 없음'),
+    ]
+    checks = [(l, (None if p is None else bool(p)), d) for l, p, d in checks]
+    score = sum(1 for _, p, _ in checks if p)
+    total = len(checks)
+
+    # 분할 계획: 현재가부터 step%씩 내려가며 균등 분할
+    n, step = params['n_split'], params['split_step']
+    prices = [cur * (1 - step / 100 * i) for i in range(n)]
+    avg = sum(prices) / n
+    per_tranche = params['max_weight'] / n
+    plan = {
+        'tranches': [(p, per_tranche) for p in prices], 'avg': avg,
+        'upside': (target / avg - 1) * 100 if avg else None,
+        'last': prices[-1],
+        'review_below': prices[-1] * (1 - step / 100),
+    }
+
+    out = {'checks': checks, 'score': score, 'total': total, 'target': target, 'cur': cur,
+           'stop': None, 'rr': None, 'loss_pct': None, 'wait_price': None,
+           'plan': plan, 'cause_txt': cause_txt, 'mode': MODE_LONG}
+
+    if cause == 'stock':
+        out['verdict'] = VERDICT_SKIP
+        out['reason'] = f"개별 악재 가능성 — {cause_txt}. 하락 원인(실적·공시)을 확인하기 전엔 매수하지 않음"
+    elif score < params['min_score_long']:
+        out['verdict'] = VERDICT_SKIP
+        out['reason'] = f"확신 점수 {score}/{total} (기준 {params['min_score_long']} 미만)"
+    elif not dipped:
+        out['verdict'] = VERDICT_WAIT
+        out['wait_price'] = high * 0.85 if high else None
+        out['reason'] = '아직 충분히 눌리지 않음 — 고점 대비 -15% 구간에서 분할 시작'
+    else:
+        out['verdict'] = VERDICT_BUY
+        out['reason'] = (f"분할매수 시작 · {cause_txt} · 평단 {int(avg):,}원 · "
+                         f"목표 상승여력 {plan['upside']:.0f}%")
+    return out
 
 
 def evaluate_stock(cur, target, n_reports, per, pbr, opm, num, params):
@@ -599,13 +694,27 @@ show_debug = st.sidebar.checkbox("진단 모드", value=False,
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**🧭 내 매수 규칙** (판정 기준)")
-min_score = st.sidebar.slider("최소 확신 점수 (9점 만점)", 3, 9, 6,
-                              help="이 점수 미만이면 '제외'")
-min_rr = st.sidebar.slider("최소 손익비", 1.0, 4.0, 2.0, 0.5,
-                           help="(목표가-현재가)/(현재가-손절가). 미달이면 '대기'")
-max_loss = st.sidebar.slider("최대 손절폭 (%)", 3, 20, 10,
-                             help="손절가까지 하락률이 이보다 크면 '대기'")
+mode = st.sidebar.radio(
+    "판정 모드", [MODE_SWING, MODE_LONG],
+    help="단기·스윙: 추세 하락이면 대기 / 중장기: 시장 요인 하락 + 체력 양호 시 분할매수")
+if mode == MODE_SWING:
+    min_score = st.sidebar.slider("최소 확신 점수 (9점 만점)", 3, 9, 6,
+                                  help="이 점수 미만이면 '제외'")
+    min_rr = st.sidebar.slider("최소 손익비", 1.0, 4.0, 2.0, 0.5,
+                               help="(목표가-현재가)/(현재가-손절가). 미달이면 '대기'")
+    max_loss = st.sidebar.slider("최대 손절폭 (%)", 3, 20, 10,
+                                 help="손절가까지 하락률이 이보다 크면 '대기'")
+else:
+    min_score, min_rr, max_loss = 6, 2.0, 10
 RULES = {'min_score': min_score, 'min_rr': min_rr, 'max_loss': max_loss}
+if mode == MODE_LONG:
+    RULES['min_score_long'] = st.sidebar.slider("최소 확신 점수 (7점 만점)", 3, 7, 5,
+                                                help="이 점수 미만이면 '제외'")
+    RULES['n_split'] = st.sidebar.slider("분할 횟수", 2, 5, 3)
+    RULES['split_step'] = st.sidebar.slider("분할 간격 (%)", 3, 15, 7,
+                                            help="직전 매수가보다 이만큼 더 내려가면 다음 분할")
+    RULES['max_weight'] = st.sidebar.slider("종목당 최대 투입 비중 (%)", 1, 20, 5,
+                                            help="전체 투자금 대비. 분할 횟수로 균등 배분")
 
 
 # ---------- 1) 수집·계산: 버튼 클릭 시에만 실행, 결과는 session_state에 보관 ----------
@@ -735,16 +844,21 @@ if res:
 
         # 종목별 판정 계산 (규칙은 현재 사이드바 값 기준)
         verdicts = {}
+        idx_dd = get_index_drawdowns() if mode == MODE_LONG else {}
         for code in hot_picks['종목코드'].unique():
             r0 = hot_picks[hot_picks['종목코드'] == code].iloc[0]
             cons = consensus.get(code, {})
             d = details_map.get(code, {})
             if not cons or not r0['현재가']:
                 continue
-            ev = evaluate_stock(
+            common = dict(
                 cur=float(r0['현재가']), target=float(cons['mean']), n_reports=int(cons['count']),
                 per=d.get('PER'), pbr=d.get('PBR'), opm=d.get('영업이익률'),
-                num=tech_signals.get(code, {}).get('_num'), params=RULES)
+                num=tech_signals.get(code, {}).get('_num'))
+            if mode == MODE_LONG:
+                ev = evaluate_stock_long(**common, mkt_dd=idx_dd.get(r0['시장']), params=RULES)
+            else:
+                ev = evaluate_stock(**common, params=RULES)
             ev['name'] = r0['종목명_x']; ev['market'] = r0['시장']
             verdicts[code] = ev
 
@@ -779,6 +893,11 @@ if res:
             - **⚪ 제외** = 점수 미달 · **💛 대기** = 점수 통과했으나 손익비/손절폭/추세/과열 미충족 · **💚 매수 적정** = 모두 통과
             - 손절가 = 최근 20일 저가 -2%, 목표가 = 증권사 평균 목표가. 기준값은 사이드바에서 조정
 
+            ### 🧭 중장기 분할매수 모드 (7점 만점)
+            - 체크 7개: 6개월 고점 대비 -15% 눌림, 시장 요인 중심 하락, 괴리율 30%, 복수 리포트, 흑자, PBR, 영업이익률
+            - **하락 원인 진단**: 종목 낙폭을 지수 낙폭과 비교 (지수의 1.5배 또는 +5%p 이내면 시장 요인, 초과하면 개별 악재 → ⚪ 제외)
+            - 통과 시 N회 분할 계획(간격·종목당 비중 기준)과 가설 재검토 조건을 제시
+
             ### 🎯 종합 시그널 판정 룰
             
             - **💚 매수 고려** = 추세 상승 + 볼린저 하단 (이상적 진입점)
@@ -797,11 +916,22 @@ if res:
         tab0, tab1, tab2 = st.tabs(["🎯 매수 판정", "📊 펀더멘털 분석", "📈 기술적 분석"])
 
         with tab0:
-            st.caption(
-                f"내 규칙: 확신 점수 ≥ {RULES['min_score']}/9 · 손익비 ≥ {RULES['min_rr']} · 손절폭 ≤ {RULES['max_loss']}% "
-                "— 매수 전에 **진입가·목표가·손절가를 먼저 정하고**, 매도는 이 약속대로 합니다. "
-                "(목표가=증권사 평균, 손절가=최근 20일 저가-2%)"
-            )
+            if mode == MODE_LONG:
+                st.caption(
+                    f"**중장기 분할매수 모드** — 점수 ≥ {RULES['min_score_long']}/7 · {RULES['n_split']}회 분할(간격 {RULES['split_step']}%) · "
+                    f"종목당 최대 {RULES['max_weight']}%. 하락이 시장 요인 중심이고 체력이 양호할 때만 나눠서 매수합니다. "
+                    "손절 대신 **가설 무효화 조건**(적자 전환, 목표가 연속 하향 등)이 생기면 재검토합니다."
+                )
+                if not idx_dd:
+                    st.warning("지수 낙폭 데이터를 가져오지 못해 '시장 요인 vs 개별 악재' 구분이 제한됩니다.")
+                else:
+                    st.caption("📉 지수 6개월 고점 대비: " + " · ".join(f"{k} {v:.1f}%" for k, v in idx_dd.items()))
+            else:
+                st.caption(
+                    f"내 규칙: 확신 점수 ≥ {RULES['min_score']}/9 · 손익비 ≥ {RULES['min_rr']} · 손절폭 ≤ {RULES['max_loss']}% "
+                    "— 매수 전에 **진입가·목표가·손절가를 먼저 정하고**, 매도는 이 약속대로 합니다. "
+                    "(목표가=증권사 평균, 손절가=최근 20일 저가-2%)"
+                )
             order = {VERDICT_BUY: 0, VERDICT_WAIT: 1, VERDICT_SKIP: 2}
             rows = []
             for code, ev in sorted(verdicts.items(), key=lambda kv: (order[kv[1]['verdict']], -kv[1]['score'])):
@@ -813,9 +943,10 @@ if res:
                     '목표가': int(ev['target']),
                     '손절가': int(ev['stop']) if ev['stop'] else None,
                     '손익비': round(ev['rr'], 1) if ev['rr'] is not None else None,
+                    '평단(분할)': int(ev['plan']['avg']) if ev.get('plan') and ev['verdict'] == VERDICT_BUY else None,
                     '사유': ev['reason'],
                 })
-            vdf = pd.DataFrame(rows)
+            vdf = pd.DataFrame(rows).dropna(axis=1, how='all')   # 모드에 안 맞는 빈 열 제거
 
             n_buy = sum(1 for e in verdicts.values() if e['verdict'] == VERDICT_BUY)
             n_wait = sum(1 for e in verdicts.values() if e['verdict'] == VERDICT_WAIT)
@@ -836,8 +967,10 @@ if res:
                                                           help="이 가격 이하에서 손익비·손절폭 규칙을 충족"),
                     "목표가": st.column_config.NumberColumn("목표가", format="%,d"),
                     "손절가": st.column_config.NumberColumn("손절가", format="%,d"),
+                    "평단(분할)": st.column_config.NumberColumn("평단(분할)", format="%,d",
+                                                            help="분할매수 완료 시 예상 평균단가"),
                 },
-                on_select="rerun", selection_mode="single-row", key="verdict_table"
+                on_select="rerun", selection_mode="single-row", key=f"verdict_table_{mode}"
             )
 
             if event0.selection.rows:
@@ -846,14 +979,33 @@ if res:
                 with card0:
                     st.markdown(f"#### 📌 {ev['name']} · {ev['market']} — {ev['verdict']}")
                     st.caption(ev['reason'])
-                    p1, p2, p3, p4 = st.columns(4)
-                    p1.metric("현재가", f"{int(ev['cur']):,}원")
-                    p2.metric("목표가(리포트 평균)", f"{int(ev['target']):,}원")
-                    p3.metric("손절가", f"{int(ev['stop']):,}원" if ev['stop'] else "-",
-                              f"-{ev['loss_pct']:.1f}%" if ev['loss_pct'] else None, delta_color="off")
-                    p4.metric("손익비", f"{ev['rr']:.1f}" if ev['rr'] is not None else "-")
-                    if ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
-                        st.warning(f"💛 **{int(ev['wait_price']):,}원 이하**로 내려오면 손익비·손절폭 규칙을 충족합니다. 그 전엔 사지 않습니다.")
+                    if ev.get('plan'):
+                        plan = ev['plan']
+                        p1, p2, p3 = st.columns(3)
+                        p1.metric("현재가", f"{int(ev['cur']):,}원")
+                        p2.metric("목표가(리포트 평균)", f"{int(ev['target']):,}원")
+                        p3.metric("분할 완료 시 평단", f"{int(plan['avg']):,}원",
+                                  f"상승여력 {plan['upside']:.0f}%" if plan['upside'] is not None else None,
+                                  delta_color="off")
+                        if ev['verdict'] == VERDICT_BUY:
+                            st.markdown("**📐 분할 매수 계획** (직전 매수가보다 간격만큼 하락할 때만 다음 매수)")
+                            st.dataframe(pd.DataFrame([
+                                {'회차': f"{i}차", '매수가': int(p), '투입 비중(%)': round(w, 2)}
+                                for i, (p, w) in enumerate(plan['tranches'], 1)
+                            ]), hide_index=True)
+                            st.info(f"🛑 **가격 손절 대신 재검토 조건**: ① {int(plan['review_below']):,}원 이하로 추가 하락 ② 적자 전환/영업이익 급감 "
+                                    "③ 증권사 목표가 연속 하향 — 하나라도 해당하면 추가 매수를 멈추고 가설을 다시 점검합니다.")
+                        elif ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
+                            st.warning(f"💛 **{int(ev['wait_price']):,}원 부근**(6개월 고점 -15%)까지 내려오면 분할을 시작합니다. 그 전엔 사지 않습니다.")
+                    else:
+                        p1, p2, p3, p4 = st.columns(4)
+                        p1.metric("현재가", f"{int(ev['cur']):,}원")
+                        p2.metric("목표가(리포트 평균)", f"{int(ev['target']):,}원")
+                        p3.metric("손절가", f"{int(ev['stop']):,}원" if ev['stop'] else "-",
+                                  f"-{ev['loss_pct']:.1f}%" if ev['loss_pct'] else None, delta_color="off")
+                        p4.metric("손익비", f"{ev['rr']:.1f}" if ev['rr'] is not None else "-")
+                        if ev['verdict'] == VERDICT_WAIT and ev['wait_price']:
+                            st.warning(f"💛 **{int(ev['wait_price']):,}원 이하**로 내려오면 손익비·손절폭 규칙을 충족합니다. 그 전엔 사지 않습니다.")
                     st.markdown("**확신 체크리스트**")
                     for label, passed, detail in ev['checks']:
                         mark = '✅' if passed else ('➖' if passed is None else '❌')
