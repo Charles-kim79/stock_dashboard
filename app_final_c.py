@@ -7,7 +7,7 @@ import re
 import time
 import hmac
 
-APP_VERSION = "v1.7"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
+APP_VERSION = "v1.8"   # 화면에 표시되는 버전은 모두 이 값 하나를 사용
 
 try:
     import yfinance as yf
@@ -1168,14 +1168,15 @@ def delete_plan(plan_id):
 def build_pick_record(code, ev, bucket, thesis='', theme='', note=''):
     """판정 결과를 관심(Pick) 레코드로. 부가정보(구분·관점·테마·메모)는 plan(jsonb)에 담아 DB 스키마 변경을 피함"""
     plan = ev.get('plan')
-    meta = {'bucket': bucket, 'thesis': thesis, 'theme': theme, 'note': note,
+    meta = {'bucket': bucket, 'thesis': thesis, 'theme': theme, 'note': note, 'ccy': 'KRW',
             'verdict': ev['verdict'], 'score': ev['score'], 'judged_mode': ev['mode']}
     if plan:
         meta.update({'tranches': [{'price': round(p), 'weight_pct': round(w, 2)} for p, w in plan['tranches']],
                      'avg': round(plan['avg']), 'review_below': round(plan['review_below'])})
     return {
         'code': code, 'name': ev['name'], 'market': ev['market'], 'mode': ev['mode'],
-        'entry_price': round(ev['cur']), 'target_price': round(ev['target']),
+        'entry_price': round(ev['cur']),
+        'target_price': round(ev['target'] if ev.get('plan') else ev.get('target_eff', ev['target'])),   # 스윙은 현실화한 목표가를 기본값으로
         'stop_price': round(ev['stop']) if ev.get('stop') else None,
         'reason': '', 'score': f"{ev['score']}/100", 'plan': meta,
         'exception': False, 'status': 'watch',
@@ -1187,8 +1188,8 @@ def get_last_price(code, market):
     if not YF_AVAILABLE:
         return None
     try:
-        df = yf.download(f"{code}{'.KS' if market == 'KOSPI' else '.KQ'}", period='5d',
-                         interval='1d', progress=False, auto_adjust=True)
+        tk = code if market == 'US' else f"{code}{'.KS' if market == 'KOSPI' else '.KQ'}"   # 해외는 티커 그대로
+        df = yf.download(tk, period='5d', interval='1d', progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return float(df['Close'].dropna().iloc[-1]) if not df.empty else None
@@ -1226,114 +1227,170 @@ def _norm(v):
     return str(v).strip()
 
 
+SELL_REASONS = ['목표 달성', '손절', '임의 매도']
+EDIT_STATUS = ['관심', '보유']          # '종료'는 아래 '매도 기록'에서만 (매도가·매도일을 반드시 남기기 위해)
+
+
+def _ccy_of(p):
+    return (p.get('plan') or {}).get('ccy') or ('USD' if p.get('market') == 'US' else 'KRW')
+
+
+def _px(v, ccy):
+    """통화별 가격 저장 형식: 원화는 정수, 달러는 소수 2자리"""
+    return int(round(float(v))) if ccy == 'KRW' else round(float(v), 2)
+
+
+def _money(v, ccy):
+    return f"{v:,.0f}원" if ccy == 'KRW' else f"${v:,.2f}"
+
+
 def render_portfolio():
-    """📂 내 관심종목: 표 하나에서 상태·구분·컨셉·메모·매수가·수량을 바로 수정하고 저장"""
-    st.subheader("📂 내 관심종목")
-    st.info("**사용법** — ① 표의 칸(상태·구분·컨셉·메모·매수가·수량)을 눌러 직접 고치고 → ② **💾 변경 저장**  \n"
-            "**삭제**: 행 왼쪽 체크박스를 선택하고 표 위 🗑 아이콘(또는 Delete 키) → ② 저장 (저장 전까지는 되돌릴 수 있음)  \n"
-            "상태를 '보유'로 바꾸려면 메모에 **매수 이유(10자 이상)**가 있어야 합니다.")
+    """📂 내 포트폴리오: 국내(원)·해외(달러) 표 + 직접 추가 + 추가 매수 평균가 + 매도 기록 + 결과 기록"""
+    st.subheader("📂 내 포트폴리오")
+    st.caption("표의 칸(상태·구분·컨셉·메모·매수가·수량·목표가·손절가)을 눌러 고친 뒤 **💾 변경 저장**. "
+               "삭제는 행 선택 → 🗑 → 저장. '보유'로 바꾸려면 메모에 매수 이유(10자 이상)가 필요합니다. "
+               "매도는 아래 '🏁 매도 기록'에서 기록하면 결과 데이터로 쌓입니다.")
     if not _sb():
         st.warning("⚠️ 저장소 미연결 — 지금은 이 브라우저 세션에만 저장돼 새로고침하면 사라집니다. "
                    "README의 'Supabase 연결'을 따라 Secrets에 키를 넣으세요.")
-    plans = [p for p in get_plans() if p.get('status') in STATUS_LABEL]
-    if not plans:
-        st.info("아직 담은 종목이 없습니다. 🔥 오늘의 핫픽이나 🔍 종목 분석에서 '📂 포트폴리오에 담기'를 누르세요.")
-        return
 
     def meta_of(p):
         return p.get('plan') or {}
 
-    # 필터: 기본값은 '전체' (새 컨셉을 담아도 목록에서 사라지지 않음)
-    themes = sorted({meta_of(p).get('theme') or '(미지정)' for p in plans})
+    plans = [p for p in get_plans() if p.get('status') in STATUS_LABEL]
+    active = [p for p in plans if p['status'] in ('watch', 'open')]
+    closed = [p for p in plans if p['status'] == 'closed']
+    ver = st.session_state.get('pf_ver', 0)
+    mac = get_macro()
+    fx = (mac.get('환율(원/$)') or {}).get('close')
+
+    # ── 요약: 보유 종목 평가 (수량이 있는 것만) ──
+    tot = {'KRW': [0.0, 0.0], 'USD': [0.0, 0.0]}        # [평가금액, 매수금액]
+    for p in active:
+        q = meta_of(p).get('qty')
+        if p['status'] == 'open' and q:
+            pr = get_last_price(p['code'], p['market'])
+            if pr:
+                c = _ccy_of(p)
+                tot[c][0] += pr * q
+                tot[c][1] += p['entry_price'] * q
+    if tot['KRW'][1] or tot['USD'][1]:
+        m1, m2, m3 = st.columns(3)
+        if tot['KRW'][1]:
+            m1.metric("🇰🇷 국내 보유 평가", f"{tot['KRW'][0]:,.0f}원",
+                      f"{(tot['KRW'][0] / tot['KRW'][1] - 1) * 100:+.1f}%", delta_color="off")
+        if tot['USD'][1]:
+            m2.metric("🌎 해외 보유 평가", f"${tot['USD'][0]:,.0f}",
+                      f"{(tot['USD'][0] / tot['USD'][1] - 1) * 100:+.1f}%", delta_color="off")
+            if fx:
+                m3.metric("해외 원화 환산", f"{tot['USD'][0] * fx:,.0f}원", f"환율 {fx:,.0f}원/$", delta_color="off")
+
+    # ── 필터 + 표 (국내/해외 분리) ──
+    themes = sorted({meta_of(p).get('theme') or '(미지정)' for p in active})
     f1, f2 = st.columns([3, 2])
-    f_status = f1.radio("상태", ['전체', '관심', '보유', '종료'], horizontal=True, key="pf_f_status")
+    f_status = f1.radio("상태", ['전체'] + EDIT_STATUS, horizontal=True, key="pf_f_status")
     f_theme = f2.selectbox("컨셉", ['전체'] + themes, key="pf_f_theme")
 
-    rows, by_id = [], {}
-    for p in plans:
-        m = meta_of(p)
-        label = STATUS_LABEL[p['status']]
-        theme = m.get('theme') or '(미지정)'
-        if (f_status != '전체' and label != f_status) or (f_theme != '전체' and theme != f_theme):
+    tables = []        # [{'ccy', 'rows', 'by_id', 'edited'}]
+    all_rows = []
+    if not active:
+        st.info("아직 담은 종목이 없습니다. 🔥 종목 스크리닝에서 담거나 아래 '➕ 종목 직접 추가'를 이용하세요.")
+    for ccy, title in (('KRW', '🇰🇷 국내 (원)'), ('USD', '🌎 해외 (달러)')):
+        rows, by_id = [], {}
+        for p in active:
+            if _ccy_of(p) != ccy:
+                continue
+            m = meta_of(p)
+            label = STATUS_LABEL[p['status']]
+            theme = m.get('theme') or '(미지정)'
+            if (f_status != '전체' and label != f_status) or (f_theme != '전체' and theme != f_theme):
+                continue
+            price = get_last_price(p['code'], p['market'])
+            by_id[p['id']] = p
+            row = {
+                'ID': p['id'], '종목': p['name'], '상태': label,
+                '구분': m.get('bucket', BUCKETS[0]), '컨셉': m.get('theme') or '',
+                '메모': m.get('note') or p.get('reason') or '',
+                '매수가': p['entry_price'], '수량': m.get('qty'),
+                '현재가': price,
+                '수익률(%)': round((price / p['entry_price'] - 1) * 100, 1) if price and p['entry_price'] else None,
+                '목표가': p['target_price'], '손절가': p.get('stop_price'),
+                '알림': plan_status(p, price),
+            }
+            rows.append(row)
+            all_rows.append({**row, '통화': ccy, '점수': m.get('score')})
+        if not rows:
             continue
-        price = get_last_price(p['code'], p['market']) if p['status'] != 'closed' else None
-        by_id[p['id']] = p
-        rows.append({
-            'ID': p['id'], '종목': p['name'], '상태': label,
-            '구분': m.get('bucket', BUCKETS[0]), '컨셉': m.get('theme') or '',
-            '메모': m.get('note') or p.get('reason') or '',
-            '매수가': p['entry_price'], '수량': m.get('qty'),
-            '현재가': int(price) if price else None,
-            '수익률(%)': round((price / p['entry_price'] - 1) * 100, 1) if price and p['entry_price'] else None,
-            '목표가': p['target_price'], '손절가': p.get('stop_price'),
-            '점수': m.get('score'), '알림': plan_status(p, price) if p['status'] != 'closed' else '',
-        })
+        st.markdown(f"**{title}**")
+        df = pd.DataFrame(rows)
+        keep_cols = [c for c in df.columns if df[c].notna().any() or c in ('수량', '목표가', '손절가')]
+        df = df[keep_cols]
+        editable = ('상태', '구분', '컨셉', '메모', '매수가', '수량', '목표가', '손절가')
+        pf = "%,d" if ccy == 'KRW' else "%,.2f"
+        step = 100 if ccy == 'KRW' else 0.01
+        edited = st.data_editor(
+            df, hide_index=True, width=1400, num_rows="dynamic",
+            disabled=[c for c in df.columns if c not in editable],
+            key=f"pf_editor_{ccy}_{ver}_{f_status}_{f_theme}",
+            column_config={
+                '상태': st.column_config.SelectboxColumn('상태', options=EDIT_STATUS, required=True),
+                '구분': st.column_config.SelectboxColumn('구분', options=BUCKETS, required=True),
+                '컨셉': st.column_config.TextColumn('컨셉', help="섹터·테마 (예: AI반도체, 배당주)"),
+                '메모': st.column_config.TextColumn('메모', help="왜 담았나 / 매수 이유", width='large'),
+                '매수가': st.column_config.NumberColumn('매수가(평균)', format=pf, min_value=0, step=step,
+                                                    help="입력한 값이 그대로 기준. 여러 번 샀다면 '➕ 추가 매수'로 평균가 갱신"),
+                '수량': st.column_config.NumberColumn('수량', format="%,d", min_value=0, step=1),
+                '현재가': st.column_config.NumberColumn('현재가', format=pf),
+                '수익률(%)': st.column_config.NumberColumn('수익률(%)', format="%.1f"),
+                '목표가': st.column_config.NumberColumn('목표가', format=pf, min_value=0, step=step,
+                                                    help="직접 입력한 목표가가 기준이 됩니다 (이력 관리)"),
+                '손절가': st.column_config.NumberColumn('손절가', format=pf, min_value=0, step=step),
+            })
+        tables.append({'ccy': ccy, 'rows': rows, 'by_id': by_id, 'edited': edited, 'editable': editable})
 
-    if not rows:
-        st.caption("조건에 맞는 종목이 없습니다.")
-        return
-
-    df = pd.DataFrame(rows).dropna(axis=1, how='all')
-    ver = st.session_state.get('pf_ver', 0)
-    editable = ('상태', '구분', '컨셉', '메모', '매수가', '수량')
-    locked = [c for c in df.columns if c not in editable]
-    edited = st.data_editor(
-        df, hide_index=True, width=1400, disabled=locked, num_rows="dynamic",
-        key=f"pf_editor_{ver}_{f_status}_{f_theme}",
-        column_config={
-            '상태': st.column_config.SelectboxColumn('상태', options=list(LABEL_STATUS.keys()), required=True),
-            '구분': st.column_config.SelectboxColumn('구분', options=BUCKETS, required=True),
-            '컨셉': st.column_config.TextColumn('컨셉', help="섹터·테마 (예: AI반도체, 배당주)"),
-            '메모': st.column_config.TextColumn('메모', help="왜 담았나 / 매수 이유", width='large'),
-            '매수가': st.column_config.NumberColumn('매수가(평균)', format="%,d", min_value=0, step=100,
-                                                help="여러 번 샀다면 아래 '➕ 추가 매수' 계산기로 평균가를 갱신"),
-            '수량': st.column_config.NumberColumn('수량', format="%,d", min_value=0, step=1),
-            '현재가': st.column_config.NumberColumn('현재가', format="%,d"),
-            '수익률(%)': st.column_config.NumberColumn('수익률(%)', format="%.1f"),
-            '목표가': st.column_config.NumberColumn('목표가', format="%,d"),
-            '손절가': st.column_config.NumberColumn('손절가', format="%,d"),
-        })
-
-    if st.button("💾 변경 저장", type="primary", key="pf_save"):
-        orig = {r['ID']: r for r in rows}
-        kept = {int(i) for i in edited['ID'].dropna()}
+    if tables and st.button("💾 변경 저장", type="primary", key="pf_save"):
         done, errors = 0, []
-        for pid in set(orig) - kept:                                  # 표에서 삭제한 행
-            ok_, msg = delete_plan(pid)
-            done += ok_
-            if not ok_:
-                errors.append(f"{orig[pid]['종목']}: {msg}")
-        for _, r in edited.iterrows():
-            if pd.isna(r['ID']):                                      # 새로 추가된 빈 행은 무시
-                continue
-            pid = int(r['ID'])
-            o, p = orig[pid], by_id[pid]
-            if all(_norm(r[k]) == _norm(o[k]) for k in editable if k in r.index and k in o):
-                continue
-            new_status = LABEL_STATUS[r['상태']]
-            theme, note = _norm(r['컨셉']), _norm(r['메모'])
-            if not theme:
-                errors.append(f"{r['종목']}: 컨셉을 입력하세요")
-                continue
-            if new_status == 'open' and p['status'] != 'open' and len(note) < 10:
-                errors.append(f"{r['종목']}: '보유'로 바꾸려면 메모에 매수 이유를 10자 이상 적으세요")
-                continue
-            meta = dict(meta_of(p))
-            meta.update({'bucket': r['구분'], 'theme': theme, 'note': note})
-            if '수량' in r.index and pd.notna(r['수량']):
-                meta['qty'] = int(r['수량'])
-            fields = {'plan': meta, 'status': new_status}
-            if '매수가' in r.index and pd.notna(r['매수가']) and r['매수가'] > 0:
-                fields['entry_price'] = int(r['매수가'])
-            if new_status == 'open' and p['status'] != 'open':
-                fields['reason'] = note
-                fields['exception'] = meta.get('verdict') != VERDICT_BUY     # 규칙 미통과 종목을 산 경우 표시
-            if new_status == 'closed' and not p.get('closed_at'):
-                fields['closed_at'] = datetime.now().isoformat()
-            ok_, msg = update_plan(pid, fields)
-            done += ok_
-            if not ok_:
-                errors.append(f"{r['종목']}: {msg}")
+        for t in tables:
+            ccy, orig, by_id, edited = t['ccy'], {r['ID']: r for r in t['rows']}, t['by_id'], t['edited']
+            kept = {int(i) for i in edited['ID'].dropna()}
+            for pid in set(orig) - kept:                                  # 표에서 삭제한 행
+                ok_, msg = delete_plan(pid)
+                done += ok_
+                if not ok_:
+                    errors.append(f"{orig[pid]['종목']}: {msg}")
+            for _, r in edited.iterrows():
+                if pd.isna(r['ID']):                                      # 새로 추가된 빈 행은 무시
+                    continue
+                pid = int(r['ID'])
+                o, p = orig[pid], by_id[pid]
+                if all(_norm(r[k]) == _norm(o[k]) for k in t['editable'] if k in r.index and k in o):
+                    continue
+                new_status = LABEL_STATUS[r['상태']]
+                theme, note = _norm(r['컨셉']), _norm(r['메모'])
+                if not theme:
+                    errors.append(f"{r['종목']}: 컨셉을 입력하세요")
+                    continue
+                if new_status == 'open' and p['status'] != 'open' and len(note) < 10:
+                    errors.append(f"{r['종목']}: '보유'로 바꾸려면 메모에 매수 이유를 10자 이상 적으세요")
+                    continue
+                meta = dict(meta_of(p))
+                meta.update({'bucket': r['구분'], 'theme': theme, 'note': note, 'ccy': ccy})
+                if '수량' in r.index and pd.notna(r['수량']):
+                    meta['qty'] = int(r['수량'])
+                fields = {'plan': meta, 'status': new_status}
+                if '매수가' in r.index and pd.notna(r['매수가']) and r['매수가'] > 0:
+                    fields['entry_price'] = _px(r['매수가'], ccy)
+                if '목표가' in r.index:
+                    fields['target_price'] = _px(r['목표가'], ccy) if pd.notna(r['목표가']) and r['목표가'] > 0 else None
+                if '손절가' in r.index:
+                    fields['stop_price'] = _px(r['손절가'], ccy) if pd.notna(r['손절가']) and r['손절가'] > 0 else None
+                if new_status == 'open' and p['status'] != 'open':
+                    fields['reason'] = note
+                    fields['exception'] = meta.get('verdict') not in (VERDICT_BUY, '-')   # 규칙 미통과 종목을 산 경우 표시
+                ok_, msg = update_plan(pid, fields)
+                done += ok_
+                if not ok_:
+                    errors.append(f"{r['종목']}: {msg}")
         for e in errors:
             st.error(e)
         if done and not errors:
@@ -1342,50 +1399,175 @@ def render_portfolio():
         elif not done and not errors:
             st.info("변경된 내용이 없습니다.")
 
-    # ➕ 추가 매수: 여러 번 샀을 때 평균 매수가·수량 자동 계산
+    # ── ➕ 종목 직접 추가 (국내/해외) ──
+    with st.expander("➕ 종목 직접 추가 (해외 종목은 여기서)"):
+        mk = st.radio("시장", ['국내', '해외'], horizontal=True, key="add_mk")
+        code = name = market = None
+        if mk == '국내':
+            ccy = 'KRW'
+            q = st.text_input("종목명 또는 6자리 코드", key="add_q_kr")
+            if q.strip():
+                cands = search_stocks(q)
+                if cands:
+                    lab = {f"{c['name']} ({c['code']}·{c['market']})": c for c in cands}
+                    c = lab[st.selectbox("검색 결과", list(lab.keys()), key="add_pick_kr")]
+                    code, name, market = c['code'], c['name'], c['market']
+                else:
+                    st.caption("검색 결과가 없습니다.")
+        else:
+            ccy = 'USD'
+            code = st.text_input("티커 (예: SMR, JOBY, IONQ)", key="add_tk").strip().upper() or None
+            name = st.text_input("종목명 (선택 — 비우면 티커로 표시)", key="add_nm").strip() or code
+            market = 'US'
+        a1, a2, a3 = st.columns(3)
+        st_label = a1.selectbox("상태", EDIT_STATUS, key="add_st")
+        bucket = a2.selectbox("구분", BUCKETS, index=2 if mk == '해외' else 0, key="add_bk")
+        theme = a3.text_input("컨셉·섹터 (필수)", key="add_th")
+        nf = "%.0f" if ccy == 'KRW' else "%.2f"
+        stp = 100.0 if ccy == 'KRW' else 0.01
+        b1, b2, b3, b4 = st.columns(4)
+        buy = b1.number_input("매수가 (관심이면 비워도 됨)", min_value=0.0, step=stp, format=nf, key="add_buy")
+        qty = b2.number_input("수량", min_value=0, step=1, key="add_qty")
+        target = b3.number_input("목표가 (필수)", min_value=0.0, step=stp, format=nf, key="add_tg")
+        stop = b4.number_input("손절가 (선택)", min_value=0.0, step=stp, format=nf, key="add_sl")
+        note = st.text_input("메모 (보유라면 매수 이유 10자 이상)", key="add_note")
+        if st.button("➕ 추가", key="add_go"):
+            err = None
+            if not code or not name:
+                err = "종목을 선택(국내)하거나 티커를 입력(해외)하세요."
+            elif not theme.strip():
+                err = "컨셉·섹터를 입력하세요."
+            elif target <= 0:
+                err = "목표가를 입력하세요. (직접 정한 목표가가 이력 관리 기준입니다)"
+            elif st_label == '보유' and (buy <= 0 or len(note.strip()) < 10):
+                err = "보유로 추가하려면 매수가와 매수 이유(메모 10자 이상)가 필요합니다."
+            elif code in {p['code'] for p in active}:
+                err = "이미 포트폴리오에 있는 종목입니다."
+            price_now = get_last_price(code, market) if code and not err else None
+            if not err and price_now is None and buy <= 0:
+                err = "현재가를 가져오지 못했습니다. 티커를 확인하거나 매수가를 직접 입력하세요."
+            if err:
+                st.error(err)
+            else:
+                entry = buy if buy > 0 else price_now
+                meta = {'bucket': bucket, 'theme': theme.strip(), 'note': note.strip(), 'ccy': ccy,
+                        'verdict': '-', 'manual': True}
+                if qty > 0:
+                    meta['qty'] = int(qty)
+                ok_, msg = save_plan({
+                    'code': code, 'name': name, 'market': market, 'mode': '-',
+                    'entry_price': _px(entry, ccy), 'target_price': _px(target, ccy),
+                    'stop_price': _px(stop, ccy) if stop > 0 else None,
+                    'reason': note.strip() if st_label == '보유' else '', 'score': None, 'plan': meta,
+                    'exception': False, 'status': LABEL_STATUS[st_label]})
+                if ok_:
+                    st.session_state['pf_ver'] = ver + 1
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # ── ➕ 추가 매수: 평균 매수가·수량 자동 계산 ──
     with st.expander("➕ 추가 매수 (평균 매수가 자동 계산)"):
-        cands = [p for p in plans if p['status'] in ('watch', 'open')]
+        cands = [p for p in active]
         if not cands:
             st.caption("관심/보유 종목이 있어야 사용할 수 있습니다.")
         else:
-            lab = {f"{p['name']} · 현재 매수가 {int(p['entry_price']):,}원 · 수량 {int(meta_of(p).get('qty') or 0):,}주": p
+            lab = {f"{p['name']} · 매수가 {_money(p['entry_price'], _ccy_of(p))} · 수량 {int(meta_of(p).get('qty') or 0):,}": p
                    for p in cands}
-            pick = st.selectbox("종목", list(lab.keys()), key="addbuy_pick")
-            p = lab[pick]
+            p = lab[st.selectbox("종목", list(lab.keys()), key="addbuy_pick")]
+            ccy = _ccy_of(p)
             old_q = int(meta_of(p).get('qty') or 0)
             g1, g2 = st.columns(2)
-            add_p = g1.number_input("이번 매수가(원)", min_value=0, step=100, key="addbuy_p")
-            add_q = g2.number_input("이번 매수 수량(주)", min_value=0, step=1, key="addbuy_q")
+            add_p = g1.number_input("이번 매수가", min_value=0.0, step=100.0 if ccy == 'KRW' else 0.01,
+                                    format="%.0f" if ccy == 'KRW' else "%.2f", key="addbuy_p")
+            add_q = g2.number_input("이번 매수 수량", min_value=0, step=1, key="addbuy_q")
             if add_p > 0 and add_q > 0:
                 if old_q <= 0:
                     st.warning("기존 수량이 없어 평균을 낼 수 없습니다. 위 표의 '수량' 칸에 기존 보유 수량을 먼저 입력·저장하세요.")
                 else:
                     new_q = old_q + int(add_q)
                     new_avg = (p['entry_price'] * old_q + add_p * add_q) / new_q
-                    st.success(f"새 평균 매수가 **{new_avg:,.0f}원** · 총 수량 **{new_q:,}주**  "
-                               f"(기존 {int(p['entry_price']):,}원×{old_q:,}주 + 추가 {int(add_p):,}원×{int(add_q):,}주)")
+                    st.success(f"새 평균 매수가 **{_money(new_avg, ccy)}** · 총 수량 **{new_q:,}**  "
+                               f"(기존 {_money(p['entry_price'], ccy)}×{old_q:,} + 추가 {_money(add_p, ccy)}×{int(add_q):,})")
                     if st.button("이 값으로 적용", key="addbuy_apply"):
                         meta = dict(meta_of(p))
                         meta['qty'] = new_q
-                        ok_, msg = update_plan(p['id'], {'plan': meta, 'entry_price': int(round(new_avg))})
+                        ok_, msg = update_plan(p['id'], {'plan': meta, 'entry_price': _px(new_avg, ccy)})
                         if ok_:
                             st.session_state['pf_ver'] = ver + 1
                             st.rerun()
                         else:
                             st.error(msg)
 
-    # 컨셉별 요약 (현재 표시 중인 종목 기준)
-    sdf = pd.DataFrame(rows)
-    sdf = sdf[sdf['상태'] != '종료']
-    if not sdf.empty:
+    # ── 🏁 매도 기록 (종료 처리) ──
+    with st.expander("🏁 매도 기록 (종료 처리 → 결과 데이터로 저장)"):
+        opens = [p for p in active if p['status'] == 'open']
+        if not opens:
+            st.caption("보유 중인 종목이 없습니다. 위 표에서 상태를 '보유'로 바꾼 종목만 매도 기록을 남길 수 있습니다.")
+        else:
+            lab = {f"{p['name']} · 매수가 {_money(p['entry_price'], _ccy_of(p))}": p for p in opens}
+            p = lab[st.selectbox("종목", list(lab.keys()), key="sell_pick")]
+            ccy = _ccy_of(p)
+            s1, s2, s3 = st.columns(3)
+            sell_p = s1.number_input("매도가 (필수)", min_value=0.0, step=100.0 if ccy == 'KRW' else 0.01,
+                                     format="%.0f" if ccy == 'KRW' else "%.2f", key="sell_p")
+            sell_d = s2.date_input("매도일", value=datetime.now().date(), key="sell_d")
+            reason = s3.selectbox("매도 이유", SELL_REASONS, key="sell_r")
+            note = st.text_input("한 줄 복기 (선택)", key="sell_n")
+            if st.button("종료 처리", key="sell_go"):
+                if sell_p <= 0:
+                    st.error("매도가를 입력하세요.")
+                else:
+                    ok_, msg = update_plan(p['id'], {
+                        'status': 'closed', 'closed_at': sell_d.isoformat(), 'close_price': _px(sell_p, ccy),
+                        'outcome': reason, 'close_note': note.strip()})
+                    if ok_:
+                        st.session_state['pf_ver'] = ver + 1
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    # ── 컨셉별 요약 ──
+    if all_rows:
+        sdf = pd.DataFrame(all_rows)
         sdf['컨셉'] = sdf['컨셉'].replace('', '(미지정)')
-        sdf['점수'] = pd.to_numeric(sdf['점수'], errors='coerce')
         sdf['수익률(%)'] = pd.to_numeric(sdf['수익률(%)'], errors='coerce')
-        g = sdf.groupby('컨셉').agg(종목수=('종목', 'size'), 평균점수=('점수', 'mean'),
-                                  평균수익률=('수익률(%)', 'mean')).round(1).reset_index()
-        with st.expander("🧭 컨셉별 요약 (평균 수익률과 담을 때 점수)"):
-            st.dataframe(g.sort_values('종목수', ascending=False), hide_index=True, width=700,
+        g = sdf.groupby('컨셉').agg(종목수=('종목', 'size'), 평균수익률=('수익률(%)', 'mean')).round(1).reset_index()
+        with st.expander("🧭 컨셉별 요약 (평균 수익률)"):
+            st.dataframe(g.sort_values('종목수', ascending=False), hide_index=True, width=500,
                          column_config={"평균수익률": st.column_config.NumberColumn("평균수익률(%)", format="%.1f")})
+
+    # ── 📈 결과 기록 (종료된 종목) ──
+    st.markdown("### 📈 결과 기록 (매도 완료)")
+    if not closed:
+        st.caption("아직 매도 기록이 없습니다. 위 '🏁 매도 기록'에서 종료 처리하면 여기에 결과가 쌓입니다.")
+    else:
+        crow = []
+        for p in closed:
+            m = meta_of(p)
+            buy_d, sell_d_ = str(p.get('created_at'))[:10], str(p.get('closed_at') or '')[:10]
+            try:
+                held = (datetime.strptime(sell_d_, '%Y-%m-%d') - datetime.strptime(buy_d, '%Y-%m-%d')).days
+            except Exception:
+                held = None
+            ret = (p['close_price'] / p['entry_price'] - 1) * 100 if p.get('close_price') and p['entry_price'] else None
+            crow.append({'종목': p['name'], '구분': m.get('bucket'), '컨셉': m.get('theme') or '',
+                         '매수가': p['entry_price'], '매도가': p.get('close_price'),
+                         '수익률(%)': round(ret, 1) if ret is not None else None,
+                         '목표가': p.get('target_price'), '매수일': buy_d, '매도일': sell_d_, '보유일': held,
+                         '매도 이유': p.get('outcome'), '매수 이유': p.get('reason'), '복기': p.get('close_note'),
+                         '통화': _ccy_of(p)})
+        cdf = pd.DataFrame(crow)
+        rets = cdf['수익률(%)'].dropna()
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("종료 건수", f"{len(cdf)}건")
+        k2.metric("승률", f"{(rets > 0).mean() * 100:.0f}%" if len(rets) else "-")
+        k3.metric("평균 수익률", f"{rets.mean():+.1f}%" if len(rets) else "-")
+        k4.metric("평균 보유일", f"{cdf['보유일'].dropna().mean():.0f}일" if cdf['보유일'].notna().any() else "-")
+        if cdf['매도 이유'].notna().any():
+            st.caption("매도 이유별: " + " · ".join(f"{k} {v}건" for k, v in cdf['매도 이유'].value_counts().items()))
+        st.dataframe(cdf.dropna(axis=1, how='all'), hide_index=True, width=1400,
+                     column_config={"수익률(%)": st.column_config.NumberColumn("수익률(%)", format="%.1f")})
 
 
 def fmt_num(v, nd=1, suf=''):
